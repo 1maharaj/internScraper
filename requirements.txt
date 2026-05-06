@@ -1,0 +1,24 @@
+# iFind Scraper API — Python dependencies
+
+# Web framework
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+
+# HTTP / scraping
+requests==2.32.3
+beautifulsoup4==4.13.4
+selenium==4.31.0
+webdriver-manager==4.0.2
+
+# AI enrichment
+cohere==5.15.0
+
+# MongoDB
+pymongo==4.12.1
+
+# Env
+python-dotenv==1.1.0
+
+# Optional NLP (LetsIntern scraper)
+# spacy==3.8.4
+# Run after install: python -m spacy download en_core_web_sm

@@ -1,0 +1,9 @@
+.env
+checkpoint_internships.json
+__pycache__/
+*.pyc
+*.pyo
+.wdm/
+data/
+scrapers/**/__pycache__/
+scrapers/**/*.json
