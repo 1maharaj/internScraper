@@ -38,13 +38,13 @@ log = logging.getLogger("script")
 # ─── Scraper registry ─────────────────────────────────────────────────────────
 # Each entry: id, label, import path (relative to SCRAPERS_DIR), main function name
 SCRAPER_REGISTRY = [
-    # {
-    #     "id":       "github",
-    #     "label":    "GitHub (2026 SWE Jobs)",
-    #     "module":   "scrapers.github_scraper",
-    #     "fn":       "scrape_github_internships",
-    #     "source":   "web_scraping",
-    # },
+    {
+        "id":       "github",
+        "label":    "GitHub (2026 SWE Jobs)",
+        "module":   "scrapers.github_scraper",
+        "fn":       "scrape_github_internships",
+        "source":   "web_scraping",
+    },
     {
         "id":       "internshala",
         "label":    "Internshala",
@@ -52,41 +52,41 @@ SCRAPER_REGISTRY = [
         "fn":       "scrape_internshala_internships",
         "source":   "web_scraping",
     },
-    # {
-    #     "id":       "indeed",
-    #     "label":    "Indeed",
-    #     "module":   "scrapers.indeed_scraper",
-    #     "fn":       "scrape_indeed_internships",
-    #     "source":   "web_scraping",
-    # },
-    # {
-    #     "id":       "naukri",
-    #     "label":    "Naukri",
-    #     "module":   "scrapers.naukri_scraper.naukri_scraper",
-    #     "fn":       "main",          # naukri main() returns list
-    #     "source":   "web_scraping",
-    # },
-    # {
-    #     "id":       "unstop",
-    #     "label":    "Unstop",
-    #     "module":   "scrapers.unstop_scraper.unstop_scraper",
-    #     "fn":       "main",          # unstop main() returns list
-    #     "source":   "web_scraping",
-    # },
-    # {
-    #     "id":       "freshersworld",
-    #     "label":    "Freshersworld",
-    #     "module":   "scrapers.freshersworld_scraper.freshersworld_scraper",
-    #     "fn":       "main",          # freshersworld main() returns list
-    #     "source":   "web_scraping",
-    # },
-    # {
-    #     "id":       "letsintern",
-    #     "label":    "LetsIntern",
-    #     "module":   "scrapers.letsintern_scraper.letsintern_scraper",
-    #     "fn":       "main",          # letsintern main() returns list
-    #     "source":   "web_scraping",
-    # },
+    {
+        "id":       "indeed",
+        "label":    "Indeed",
+        "module":   "scrapers.indeed_scraper",
+        "fn":       "scrape_indeed_internships",
+        "source":   "web_scraping",
+    },
+    {
+        "id":       "naukri",
+        "label":    "Naukri",
+        "module":   "scrapers.naukri_scraper.naukri_scraper",
+        "fn":       "main",          # naukri main() returns list
+        "source":   "web_scraping",
+    },
+    {
+        "id":       "unstop",
+        "label":    "Unstop",
+        "module":   "scrapers.unstop_scraper.unstop_scraper",
+        "fn":       "main",          # unstop main() returns list
+        "source":   "web_scraping",
+    },
+    {
+        "id":       "freshersworld",
+        "label":    "Freshersworld",
+        "module":   "scrapers.freshersworld_scraper.freshersworld_scraper",
+        "fn":       "main",          # freshersworld main() returns list
+        "source":   "web_scraping",
+    },
+    {
+        "id":       "letsintern",
+        "label":    "LetsIntern",
+        "module":   "scrapers.letsintern_scraper.letsintern_scraper",
+        "fn":       "main",          # letsintern main() returns list
+        "source":   "web_scraping",
+    },
 ]
 
 
