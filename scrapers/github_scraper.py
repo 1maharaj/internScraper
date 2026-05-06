@@ -14,7 +14,7 @@ import re
 load_dotenv()
 
 # Global configuration - change this to scrape more/fewer internships
-MAX_INTERNSHIPS = 5
+MAX_INTERNSHIPS = 300
 
 def scrape_github_internships(max_internships=None):
     """Scrape internships from the GitHub README"""

@@ -36,7 +36,7 @@ log = logging.getLogger("naukri-intern")
 # ── Config ────────────────────────────────────────────────────────────────────
 SEARCH_KEYWORD  = ""        # e.g. "software developer", "marketing", "" for all
 SEARCH_LOCATION = ""        # e.g. "bangalore", "" for all India
-PAGES           = 10
+PAGES           = 8         # ~300 internships at ~40/page
 OUTPUT_RAW      = "internships_raw.json"
 OUTPUT_FINAL    = "internships.json"
 

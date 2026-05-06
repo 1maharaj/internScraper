@@ -80,13 +80,22 @@ _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 
 ALL_SCRAPERS = ["github", "internshala", "indeed", "naukri", "unstop", "freshersworld", "letsintern"]
+DEFAULT_MAX  = 300
 
 
 # ─── Request / Response models ────────────────────────────────────────────────
 
 class ScrapeRequest(BaseModel):
-    scrapers:    list[str] = ALL_SCRAPERS
-    skip_scrape: bool      = False
+    """
+    scrapers: list of scraper IDs, or list of {id: max} dicts to override per-scraper limits.
+
+    Examples:
+        {"scrapers": ["github", "internshala"]}
+        {"scrapers": [{"github": 50}, {"internshala": 200}, "naukri"]}
+        {"scrapers": [{"github": 100}], "skip_scrape": false}
+    """
+    scrapers:    list[str | dict[str, int]] = ALL_SCRAPERS
+    skip_scrape: bool                       = False
 
 
 class JobStatus(BaseModel):
@@ -100,13 +109,14 @@ class JobStatus(BaseModel):
 
 # ─── Background worker ────────────────────────────────────────────────────────
 
-def _run_job(job_id: str, scrapers: list[str], skip_scrape: bool):
+def _run_job(job_id: str, scrapers: list[str], skip_scrape: bool, max_values: dict[str, int]):
     """Runs in a daemon thread. Updates _jobs[job_id] when done."""
-    log.info("[job:%s] Starting — scrapers=%s skip_scrape=%s", job_id, scrapers, skip_scrape)
+    log.info("[job:%s] Starting — scrapers=%s max_values=%s skip_scrape=%s",
+             job_id, scrapers, max_values, skip_scrape)
 
     try:
         from script import main as run_pipeline
-        stats = run_pipeline(selected_ids=scrapers, skip_scrape=skip_scrape)
+        stats = run_pipeline(selected_ids=scrapers, skip_scrape=skip_scrape, max_values=max_values)
 
         with _jobs_lock:
             _jobs[job_id].update({
@@ -136,20 +146,51 @@ def health():
 
 # just to change git status
 @app.post("/scrape", status_code=202)
-def start_scrape(req: ScrapeRequest): 
+def start_scrape(req: ScrapeRequest):
     """
     Kick off a background scrape job.
-    Returns immediately with a job_id — poll GET /scrape/{job_id} for results.
+
+    scrapers field accepts mixed format:
+      - plain string:  "github"              → uses DEFAULT_MAX (300)
+      - dict:          {"github": 50}        → overrides max for that scraper
+
+    Example body:
+      {
+        "scrapers": [{"github": 50}, {"internshala": 200}, "naukri"],
+        "skip_scrape": false
+      }
     """
-    # Validate scraper names
-    invalid = [s for s in req.scrapers if s not in ALL_SCRAPERS]
+    # Parse scrapers field into (id_list, max_values_dict)
+    scraper_ids: list[str] = []
+    max_values:  dict[str, int] = {}
+
+    for entry in req.scrapers:
+        if isinstance(entry, str):
+            scraper_ids.append(entry)
+        elif isinstance(entry, dict):
+            for scraper_id, max_val in entry.items():
+                scraper_ids.append(scraper_id)
+                if isinstance(max_val, int) and max_val > 0:
+                    max_values[scraper_id] = max_val
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Max value for '{scraper_id}' must be a positive integer, got: {max_val}",
+                    )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Each entry in 'scrapers' must be a string or {{id: max}} dict, got: {entry}",
+            )
+
+    invalid = [s for s in scraper_ids if s not in ALL_SCRAPERS]
     if invalid:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown scrapers: {invalid}. Valid options: {ALL_SCRAPERS}",
         )
 
-    job_id = str(uuid.uuid4())
+    job_id     = str(uuid.uuid4())
     started_at = datetime.now(timezone.utc).isoformat()
 
     with _jobs_lock:
@@ -161,19 +202,20 @@ def start_scrape(req: ScrapeRequest):
             "error":       None,
         }
 
-    # Fire and forget
     t = threading.Thread(
         target=_run_job,
-        args=(job_id, req.scrapers, req.skip_scrape),
+        args=(job_id, scraper_ids, req.skip_scrape, max_values),
         daemon=True,
     )
     t.start()
 
     return {
-        "job_id":    job_id,
-        "status":    "running",
-        "message":   (
-            f"Scrape job started for: {', '.join(req.scrapers)}. "
+        "job_id":     job_id,
+        "status":     "running",
+        "scrapers":   scraper_ids,
+        "max_values": {s: max_values.get(s, DEFAULT_MAX) for s in scraper_ids},
+        "message":    (
+            f"Scrape job started for: {', '.join(scraper_ids)}. "
             f"Poll GET /scrape/{job_id} for status."
         ),
         "started_at": started_at,

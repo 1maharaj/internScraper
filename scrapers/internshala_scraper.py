@@ -15,7 +15,7 @@ import time
 load_dotenv()
 
 # Global configuration - change this to scrape more/fewer internships
-MAX_INTERNSHIPS = 50
+MAX_INTERNSHIPS = 300
 
 def parse_stipend(stipend_text: str) -> dict:
     """

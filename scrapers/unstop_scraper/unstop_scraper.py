@@ -36,7 +36,7 @@ logging.basicConfig(
 log = logging.getLogger("unstop")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TARGET       = 400        # Stop after collecting this many unique internships
+TARGET       = 300        # Stop after collecting this many unique internships
 PER_PAGE     = 20         # Items per API page (max 20)
 MAX_PAGES    = 100        # Safety cap on pages to fetch
 OUTPUT_RAW   = "unstop_raw.json"

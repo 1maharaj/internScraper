@@ -35,57 +35,71 @@ logging.basicConfig(
 )
 log = logging.getLogger("script")
 
+# ─── Default max per scraper ──────────────────────────────────────────────────
+DEFAULT_MAX = 300
+
 # ─── Scraper registry ─────────────────────────────────────────────────────────
-# Each entry: id, label, import path (relative to SCRAPERS_DIR), main function name
+# Each entry: id, label, module, fn, source, max_param (how the scraper accepts a limit)
+#   max_param = "arg"        → pass max as first positional arg to fn()
+#   max_param = "TARGET"     → patch module.TARGET before calling main()
+#   max_param = "PAGES"      → patch module.PAGES (naukri: ~40/page, so pages = max//40)
+#   max_param = None         → no cap supported (letsintern scrapes all URLs it finds)
 SCRAPER_REGISTRY = [
     {
-        "id":       "github",
-        "label":    "GitHub (2026 SWE Jobs)",
-        "module":   "scrapers.github_scraper",
-        "fn":       "scrape_github_internships",
-        "source":   "web_scraping",
+        "id":        "github",
+        "label":     "GitHub (2026 SWE Jobs)",
+        "module":    "scrapers.github_scraper",
+        "fn":        "scrape_github_internships",
+        "source":    "web_scraping",
+        "max_param": "arg",
     },
     {
-        "id":       "internshala",
-        "label":    "Internshala",
-        "module":   "scrapers.internshala_scraper",
-        "fn":       "scrape_internshala_internships",
-        "source":   "web_scraping",
+        "id":        "internshala",
+        "label":     "Internshala",
+        "module":    "scrapers.internshala_scraper",
+        "fn":        "scrape_internshala_internships",
+        "source":    "web_scraping",
+        "max_param": "arg",
     },
     {
-        "id":       "indeed",
-        "label":    "Indeed",
-        "module":   "scrapers.indeed_scraper",
-        "fn":       "scrape_indeed_internships",
-        "source":   "web_scraping",
+        "id":        "indeed",
+        "label":     "Indeed",
+        "module":    "scrapers.indeed_scraper",
+        "fn":        "scrape_indeed_internships",
+        "source":    "web_scraping",
+        "max_param": "arg",
     },
     {
-        "id":       "naukri",
-        "label":    "Naukri",
-        "module":   "scrapers.naukri_scraper.naukri_scraper",
-        "fn":       "main",          # naukri main() returns list
-        "source":   "web_scraping",
+        "id":        "naukri",
+        "label":     "Naukri",
+        "module":    "scrapers.naukri_scraper.naukri_scraper",
+        "fn":        "main",
+        "source":    "web_scraping",
+        "max_param": "PAGES",   # naukri uses PAGES; ~40 results/page
     },
     {
-        "id":       "unstop",
-        "label":    "Unstop",
-        "module":   "scrapers.unstop_scraper.unstop_scraper",
-        "fn":       "main",          # unstop main() returns list
-        "source":   "web_scraping",
+        "id":        "unstop",
+        "label":     "Unstop",
+        "module":    "scrapers.unstop_scraper.unstop_scraper",
+        "fn":        "main",
+        "source":    "web_scraping",
+        "max_param": "TARGET",
     },
     {
-        "id":       "freshersworld",
-        "label":    "Freshersworld",
-        "module":   "scrapers.freshersworld_scraper.freshersworld_scraper",
-        "fn":       "main",          # freshersworld main() returns list
-        "source":   "web_scraping",
+        "id":        "freshersworld",
+        "label":     "Freshersworld",
+        "module":    "scrapers.freshersworld_scraper.freshersworld_scraper",
+        "fn":        "main",
+        "source":    "web_scraping",
+        "max_param": "TARGET",
     },
     {
-        "id":       "letsintern",
-        "label":    "LetsIntern",
-        "module":   "scrapers.letsintern_scraper.letsintern_scraper",
-        "fn":       "main",          # letsintern main() returns list
-        "source":   "web_scraping",
+        "id":        "letsintern",
+        "label":     "LetsIntern",
+        "module":    "scrapers.letsintern_scraper.letsintern_scraper",
+        "fn":        "main",
+        "source":    "web_scraping",
+        "max_param": None,      # scrapes all URLs it finds; no numeric cap
     },
 ]
 
@@ -117,12 +131,12 @@ def save_checkpoint(internships: list):
 
 # ─── Scraper runner ───────────────────────────────────────────────────────────
 
-def run_scraper(scraper: dict) -> list:
+def run_scraper(scraper: dict, max_items: int = DEFAULT_MAX) -> list:
     """
     Dynamically import and run a scraper module.
+    Applies max_items according to each scraper's max_param strategy.
     Returns a list of raw internship dicts.
     """
-    # Add SCRAPER_DIR to sys.path so relative imports work
     scraper_dir_str = str(SCRAPER_DIR)
     if scraper_dir_str not in sys.path:
         sys.path.insert(0, scraper_dir_str)
@@ -131,7 +145,25 @@ def run_scraper(scraper: dict) -> list:
         import importlib
         mod = importlib.import_module(scraper["module"])
         fn  = getattr(mod, scraper["fn"])
-        result = fn()
+        max_param = scraper.get("max_param")
+
+        if max_param == "arg":
+            # fn accepts max as first positional argument
+            result = fn(max_items)
+        elif max_param == "TARGET":
+            # patch module-level TARGET before calling main()
+            mod.TARGET = max_items
+            result = fn()
+        elif max_param == "PAGES":
+            # naukri: ~40 results per page, round up
+            pages = max(1, (max_items + 39) // 40)
+            mod.PAGES = pages
+            log.info("  [naukri] max_items=%d → PAGES=%d", max_items, pages)
+            result = fn()
+        else:
+            # No cap supported — run as-is
+            result = fn()
+
         if result is None:
             return []
         if isinstance(result, list):
@@ -145,13 +177,12 @@ def run_scraper(scraper: dict) -> list:
 
 # ─── Main orchestrator ────────────────────────────────────────────────────────
 
-def run_all_scrapers(selected_ids: list[str]) -> list:
+def run_all_scrapers(selected_ids: list[str], max_values: dict[str, int] | None = None) -> list:
     """
     Run all selected scrapers sequentially.
-    Accumulates results in memory AND checkpoints to file after each scraper.
-    Returns the full list of raw internship dicts.
+    max_values: optional per-scraper overrides, e.g. {"github": 50, "naukri": 200}
+    Falls back to DEFAULT_MAX for any scraper not in max_values.
     """
-    # Start from existing checkpoint (resume if interrupted)
     all_internships = load_checkpoint()
     already_scraped_count = len(all_internships)
 
@@ -164,22 +195,20 @@ def run_all_scrapers(selected_ids: list[str]) -> list:
     log.info("Resuming from checkpoint: %d existing internships\n", already_scraped_count)
 
     for scraper in active:
-        log.info("━━━ %s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", scraper["label"])
-        items = run_scraper(scraper)
+        max_items = (max_values or {}).get(scraper["id"], DEFAULT_MAX)
+        log.info("━━━ %s (max: %d) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", scraper["label"], max_items)
+        items = run_scraper(scraper, max_items=max_items)
 
         if not items:
             log.warning("  No internships returned from %s", scraper["label"])
             continue
 
-        # Tag each item with its source
         for item in items:
             item["_scraper_source"] = scraper["source"]
             item["_scraper_id"]     = scraper["id"]
 
         log.info("  ✓ %s returned %d internships", scraper["label"], len(items))
         all_internships.extend(items)
-
-        # Checkpoint after every scraper so partial results survive crashes
         save_checkpoint(all_internships)
 
     log.info("\n📊 Total scraped: %d internships", len(all_internships))
@@ -243,16 +272,14 @@ def push_all_to_db(internships: list) -> dict:
 
 # ─── CLI entry point ──────────────────────────────────────────────────────────
 
-def main(selected_ids: list[str] | None = None, skip_scrape: bool = False) -> dict:
+def main(selected_ids: list[str] | None = None, skip_scrape: bool = False, max_values: dict[str, int] | None = None) -> dict:
     """
     Main entry point — can be called from CLI or from app.py.
-
-    Returns aggregate stats dict.
+    max_values: per-scraper overrides, e.g. {"github": 50, "naukri": 200}
     """
     if selected_ids is None:
         selected_ids = [s["id"] for s in SCRAPER_REGISTRY]
 
-    # Phase 1: Scrape
     if skip_scrape:
         log.info("⏭  --skip-scrape: loading from checkpoint only")
         internships = load_checkpoint()
@@ -260,7 +287,7 @@ def main(selected_ids: list[str] | None = None, skip_scrape: bool = False) -> di
             log.warning("No checkpoint found and --skip-scrape was set. Nothing to push.")
             return {"saved": 0, "duplicate": 0, "rejected": 0, "errors": 0}
     else:
-        internships = run_all_scrapers(selected_ids)
+        internships = run_all_scrapers(selected_ids, max_values=max_values)
 
     if not internships:
         log.warning("No internships to push.")

@@ -15,7 +15,7 @@ import urllib.parse
 load_dotenv()
 
 # Global configuration - change this to scrape more/fewer internships
-MAX_INTERNSHIPS = 50
+MAX_INTERNSHIPS = 300
 
 def scrape_indeed_internships(max_internships=None, location="United States"):
     """Scrape internships from Indeed"""
