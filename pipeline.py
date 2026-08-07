@@ -1,19 +1,111 @@
 """
-pipeline.py — Moderation pipeline (Python port of scrape-and-moderate.mjs)
+pipeline.py — Moderation pipeline integrated with scam_detector
 
-Validates, deduplicates, scores, and inserts internships into MongoDB.
-Each scraper's output is normalized to the internship_format schema before insertion.
+Validates, deduplicates, runs scam detection, normalizes internships to the
+canonical Internship schema defined in ifind/types/internship.ts, and stores
+them in the MongoDB collection 'internships.mod-unvectorised'.
 """
 
 import re
 import hashlib
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, List, Literal, TypedDict, Any, Dict
 
 from pymongo.collection import Collection
 
 log = logging.getLogger("pipeline")
+
+
+# ─── Python TypedDict definitions (matching ifind/types/internship.ts) ────────
+
+class StipendDict(TypedDict, total=False):
+    type: Literal["paid", "unpaid", "performance-based"]
+    amount: Optional[float]
+    currency: Optional[str]
+    period: Optional[Literal["monthly", "weekly", "lump-sum"]]
+
+
+class DurationDict(TypedDict, total=False):
+    value: int
+    unit: Literal["weeks", "months"]
+
+
+class ExperienceRequiredDict(TypedDict, total=False):
+    min: Optional[int]
+    max: Optional[int]
+    unit: Literal["months", "years"]
+
+
+class LinkVerificationDict(TypedDict, total=False):
+    reachable: Optional[bool]
+    statusCode: Optional[int]
+    redirectedTo: Optional[str]
+    isScamSuspected: Optional[bool]
+    isExpired: Optional[bool]
+    scamSignals: List[str]
+    checkedAt: Optional[str]
+    nextCheckAt: Optional[str]
+
+
+class RiskBreakdownDict(TypedDict, total=False):
+    textRisk: Optional[float]
+    companyRisk: Optional[float]
+    urlRisk: Optional[float]
+    stipendRisk: Optional[float]
+    anomalyScore: Optional[float]
+
+
+class ScamDetailsDict(TypedDict, total=False):
+    score: float
+    decision: Literal["clear", "review", "block"]
+    confidence: float
+    explanationSummary: str
+    scamFlags: List[str]
+    evaluatedAt: Optional[str]
+    riskBreakdown: Optional[RiskBreakdownDict]
+
+
+class ModerationDict(TypedDict, total=False):
+    status: Literal["auto_approved", "pending_review", "auto_rejected", "manually_approved", "manually_rejected"]
+    score: Optional[float]
+    flags: List[str]
+    source: Literal["web_scraping", "api", "user_contributed", "email_parsing", "rss", "community_bot", "manual"]
+    reviewedBy: Optional[str]
+    reviewedAt: Optional[str]
+    rejectionReason: Optional[str]
+    scamDetails: Optional[ScamDetailsDict]
+
+
+class InternshipDict(TypedDict, total=False):
+    _id: Optional[str]
+    name: str
+    company: str
+    applyLink: str
+    datePublished: str
+    deadlineDate: Optional[str]
+    country: Optional[str]
+    state: Optional[str]
+    city: Optional[str]
+    isRemote: bool
+    stipend: StipendDict
+    duration: DurationDict
+    skills: List[str]
+    degree: Optional[List[str]]
+    field: Optional[List[str]]
+    experienceRequired: Optional[ExperienceRequiredDict]
+    openings: Optional[int]
+    summary: str
+    responsibilities: Optional[List[str]]
+    perks: Optional[List[str]]
+    tags: Optional[List[str]]
+    source: Optional[str]
+    isActive: bool
+    fingerprint: Optional[str]
+    linkVerification: Optional[LinkVerificationDict]
+    moderation: Optional[ModerationDict]
+    createdAt: str
+    updatedAt: str
 
 
 # ─── Fingerprint ──────────────────────────────────────────────────────────────
@@ -25,10 +117,11 @@ def generate_fingerprint(company: str, name: str, city: str) -> str:
 
 # ─── Normalizers ──────────────────────────────────────────────────────────────
 
-def normalize_duration(raw) -> dict:
+def normalize_duration(raw) -> DurationDict:
     """Accept a dict with value+unit, a duration_string, or fall back to default."""
     if isinstance(raw, dict) and raw.get("value") and raw.get("unit"):
-        return raw
+        unit = "weeks" if "week" in str(raw.get("unit")).lower() else "months"
+        return {"value": int(raw["value"]), "unit": unit}
 
     if isinstance(raw, str) and raw:
         m = re.search(r"(\d+)\s*(week|month)", raw, re.IGNORECASE)
@@ -39,10 +132,18 @@ def normalize_duration(raw) -> dict:
     return {"value": 3, "unit": "months"}
 
 
-def normalize_stipend(raw) -> dict:
+def normalize_stipend(raw) -> StipendDict:
     """Accept a structured dict or a plain string like '₹ 12,000 /month'."""
     if isinstance(raw, dict) and raw.get("type"):
-        return raw
+        stype = str(raw.get("type")).lower().replace("_", "-")
+        if stype not in ("paid", "unpaid", "performance-based"):
+            stype = "paid" if raw.get("amount") else "unpaid"
+        return {
+            "type": stype,
+            "amount": float(raw.get("amount")) if raw.get("amount") is not None else None,
+            "currency": str(raw.get("currency") or "INR"),
+            "period": raw.get("period") or None,
+        }
 
     if isinstance(raw, str) and raw and raw.lower() not in ("n/a", "unpaid", "not disclosed"):
         text = raw.strip()
@@ -63,7 +164,7 @@ def normalize_stipend(raw) -> dict:
 
         clean = text.replace(",", "")
         amount_match = re.search(r"(\d+)", clean)
-        amount = int(amount_match.group(1)) if amount_match else None
+        amount = float(amount_match.group(1)) if amount_match else None
 
         period = None
         if re.search(r"/month|per month|monthly", text, re.IGNORECASE):
@@ -80,12 +181,11 @@ def normalize_stipend(raw) -> dict:
             "period": period,
         }
 
-    return {"type": "unpaid", "amount": None, "currency": "USD", "period": None}
+    return {"type": "unpaid", "amount": None, "currency": "INR", "period": None}
 
 
 def normalize_location(item: dict) -> tuple[str, str, bool]:
     """Return (city, country, is_remote) from various scraper field layouts."""
-    # Scrapers use different field names
     city = (
         item.get("city")
         or item.get("location")
@@ -100,7 +200,6 @@ def normalize_location(item: dict) -> tuple[str, str, bool]:
 
     country = item.get("country") or ""
     if not country:
-        # Guess from city
         if re.search(r"remote|wfh|online", city, re.IGNORECASE):
             country = ""
         elif re.search(
@@ -138,12 +237,39 @@ def normalize_summary(item: dict) -> str:
     return str(s).strip()
 
 
-# ─── Scoring ──────────────────────────────────────────────────────────────────
+def normalize_link_verification(item: dict) -> LinkVerificationDict:
+    """Preserve existing linkVerification / linkVerified or build non-null defaults."""
+    raw = item.get("linkVerification") or item.get("linkVerified")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    next_check_iso = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+
+    if isinstance(raw, dict):
+        return {
+            "reachable": raw.get("reachable") if raw.get("reachable") is not None else True,
+            "statusCode": raw.get("statusCode") if raw.get("statusCode") is not None else 200,
+            "redirectedTo": raw.get("redirectedTo") or None,
+            "isScamSuspected": raw.get("isScamSuspected") if raw.get("isScamSuspected") is not None else False,
+            "isExpired": raw.get("isExpired") if raw.get("isExpired") is not None else False,
+            "scamSignals": raw.get("scamSignals") if isinstance(raw.get("scamSignals"), list) else [],
+            "checkedAt": raw.get("checkedAt") or now_iso,
+            "nextCheckAt": raw.get("nextCheckAt") or next_check_iso,
+        }
+
+    return {
+        "reachable": True,
+        "statusCode": 200,
+        "redirectedTo": None,
+        "isScamSuspected": False,
+        "isExpired": False,
+        "scamSignals": [],
+        "checkedAt": now_iso,
+        "nextCheckAt": next_check_iso,
+    }
+
 
 def score_internship(name: str, company: str, apply_link: str, summary: str, skills: list) -> int:
     """
-    Simplified scoring (no live link check for bulk import).
-    Max possible = 50.
+    Simplified scoring check. Max possible = 50.
     """
     score = 0
     if name and company and apply_link and summary:
@@ -152,7 +278,7 @@ def score_internship(name: str, company: str, apply_link: str, summary: str, ski
         score += 10
     if len(summary) >= 80:
         score += 10
-    score += 5  # no deadline penalty
+    score += 5
     return score
 
 
@@ -165,12 +291,19 @@ def push_to_pipeline(
     label: str = "",
 ) -> dict:
     """
-    Process a list of raw scraped internships through the moderation pipeline
-    and insert passing ones into MongoDB.
+    Process a list of raw scraped internships through basic validation,
+    scam detection, and normalization into canonical Internship schema,
+    storing passing records in collection 'internships.mod-unvectorised'.
 
     Returns stats dict: {saved, duplicate, rejected, errors}
     """
     stats = {"saved": 0, "duplicate": 0, "rejected": 0, "errors": 0}
+
+    # Ensure collection points to 'internships.mod-unvectorised'
+    if col.name != "internships.mod-unvectorised":
+        col = col.database["internships.mod-unvectorised"]
+
+    valid_candidates: list[dict] = []
 
     for item in items:
         try:
@@ -199,28 +332,18 @@ def push_to_pipeline(
                 stats["duplicate"] += 1
                 continue
 
-            # ── Score & gate ──────────────────────────────────────────────
-            score = score_internship(name, company, apply_link, summary, skills)
-            if score < 40:
-                log.debug("  ❌ Auto-rejected: '%s' (score: %d)", name, score)
-                stats["rejected"] += 1
-                continue
-
-            status = "pending_review"
-
             # ── Normalize sub-fields ──────────────────────────────────────
             stipend  = normalize_stipend(item.get("stipend") or item.get("stipend_text") or "")
             duration = normalize_duration(item.get("duration") or item.get("duration_string") or "")
 
-            # Deadline
-            deadline_date: Optional[datetime] = None
+            deadline_date_str: Optional[str] = None
             if item.get("deadline_date"):
                 try:
-                    deadline_date = datetime.fromisoformat(str(item["deadline_date"]))
+                    dt = datetime.fromisoformat(str(item["deadline_date"]))
+                    deadline_date_str = dt.isoformat()
                 except Exception:
-                    pass
+                    deadline_date_str = str(item["deadline_date"])
 
-            # Degree / field
             raw_degree = item.get("degree")
             degree = (
                 raw_degree if isinstance(raw_degree, list)
@@ -234,66 +357,106 @@ def push_to_pipeline(
                 else None
             )
 
-            next_check_at = datetime.now(timezone.utc) + timedelta(days=7)
-            now = datetime.now(timezone.utc)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            next_check_iso = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
 
-            doc = {
-                "name":       name,
-                "company":    company,
-                "applyLink":  apply_link,
-                "summary":    summary,
-                "city":       city or None,
-                "country":    country or None,
-                "state":      item.get("state") or None,
-                "isRemote":   is_remote,
-                "skills":     skills,
-                "degree":     degree,
-                "field":      field,
-                "responsibilities": (
+            # Construct InternshipDict matching canonical TS schema
+            candidate_doc: InternshipDict = {
+                "name":               name,
+                "company":            company,
+                "applyLink":          apply_link,
+                "summary":            summary,
+                "city":               city or None,
+                "country":            country or None,
+                "state":              item.get("state") or None,
+                "isRemote":           is_remote,
+                "skills":             skills,
+                "degree":             degree,
+                "field":              field,
+                "responsibilities":   (
                     item["responsibilities"]
                     if isinstance(item.get("responsibilities"), list)
                     else None
                 ),
-                "perks":    item.get("perks") if isinstance(item.get("perks"), list) else None,
-                "tags":     item.get("tags")  if isinstance(item.get("tags"),  list) else None,
-                "openings": item.get("openings") or None,
-                "source":   source,
-                "isActive": True,
-                "datePublished": now,
-                "deadlineDate":  deadline_date,
-                "stipend":   stipend,
-                "duration":  duration,
+                "perks":              item.get("perks") if isinstance(item.get("perks"), list) else None,
+                "tags":               item.get("tags") if isinstance(item.get("tags"), list) else None,
+                "openings":           item.get("openings") or None,
+                "source":             source,
+                "isActive":           True,
+                "datePublished":      now_iso,
+                "deadlineDate":       deadline_date_str,
+                "stipend":            stipend,
+                "duration":           duration,
                 "experienceRequired": {"unit": "months"},
-                "fingerprint": fingerprint,
-                "linkVerification": {
-                    "reachable":       None,
-                    "statusCode":      None,
-                    "redirectedTo":    None,
-                    "isScamSuspected": None,
-                    "isExpired":       None,
-                    "scamSignals":     [],
-                    "checkedAt":       None,
-                    "nextCheckAt":     next_check_at,
-                },
-                "moderation": {
-                    "status":          status,
-                    "score":           score,
-                    "flags":           ["missing_skills"] if not skills else [],
-                    "source":          source,
-                    "reviewedBy":      None,
-                    "reviewedAt":      None,
-                    "rejectionReason": None,
-                },
-                "createdAt": now,
-                "updatedAt": now,
+                "fingerprint":        fingerprint,
+                "linkVerification":   normalize_link_verification(item),
+                "createdAt":           now_iso,
+                "updatedAt":           now_iso,
             }
 
-            col.insert_one(doc)
-            log.info("  ✅ [%s] score:%d — '%s' @ %s", status, score, name, company)
-            stats["saved"] += 1
+            valid_candidates.append(candidate_doc)
 
         except Exception as e:
             log.error("  💥 Error processing '%s': %s", item.get("name") or item.get("title", "?"), e)
+            stats["errors"] += 1
+
+    if not valid_candidates:
+        return stats
+
+    # ── Run scam_detector pipeline ──────────────────────────────────────────
+    try:
+        from scam_detector.pipeline import process_records
+        scored_candidates = process_records(valid_candidates)
+    except Exception as exc:
+        log.warning("Scam detector processing failed (%s) — falling back to standard scoring", exc)
+        scored_candidates = valid_candidates
+
+    # ── Final Moderation assembly & insertion into MongoDB ──────────────────
+    for doc in scored_candidates:
+        try:
+            scam_score = float(doc.get("scam_score", 0.0))
+            decision = doc.get("decision", "clear")  # "clear" | "review" | "block"
+            confidence = float(doc.get("confidence", 1.0))
+            summary_exp = str(doc.get("explanation_summary", ""))
+
+            raw_flags = []
+            if isinstance(doc.get("moderation"), dict):
+                raw_flags = doc["moderation"].get("flags") or []
+
+            scam_details: ScamDetailsDict = {
+                "score":              scam_score,
+                "decision":           decision if decision in ("clear", "review", "block") else "clear",
+                "confidence":         confidence,
+                "explanationSummary": summary_exp,
+                "scamFlags":          raw_flags,
+                "evaluatedAt":        datetime.now(timezone.utc).isoformat(),
+                "riskBreakdown":      None,
+            }
+
+            if decision == "clear":
+                mod_status = "auto_approved"
+            elif decision == "block":
+                mod_status = "auto_rejected"
+            else:
+                mod_status = "pending_review"
+
+            doc["moderation"] = {
+                "status":          mod_status,
+                "score":           scam_score,
+                "flags":           raw_flags,
+                "source":          source if source in ("web_scraping", "api", "user_contributed", "email_parsing", "rss", "community_bot", "manual") else "web_scraping",
+                "reviewedBy":      None,
+                "reviewedAt":      datetime.now(timezone.utc).isoformat(),
+                "rejectionReason": summary_exp if decision == "block" else None,
+                "scamDetails":     scam_details,
+            }
+
+            col.insert_one(doc)
+            log.info("  ✅ [%s] scam_score:%.1f — '%s' @ %s", mod_status, scam_score, doc["name"], doc["company"])
+            stats["saved"] += 1
+
+        except Exception as e:
+            log.error("  💥 Error inserting '%s': %s", doc.get("name", "?"), e)
             stats["errors"] += 1
 
     return stats

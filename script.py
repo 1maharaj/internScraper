@@ -239,7 +239,7 @@ def push_all_to_db(internships: list) -> dict:
     log.info("\n🔌 Connecting to MongoDB...")
     client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
     db  = client["ifind"]
-    col = db["internships"]
+    col = db["internships.mod-unvectorised"]
     log.info("✅ Connected\n")
 
     from pipeline import push_to_pipeline

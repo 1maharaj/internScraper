@@ -246,9 +246,52 @@ def list_jobs():
     return {"jobs": jobs, "total": len(jobs)}
 
 
+# ─── Display Routes on Startup ────────────────────────────────────────────────
+
+ENDPOINT_DESCRIPTIONS = {
+    "/health": "Liveness health check to verify service status",
+    ("/scrape", "POST"): "Starts a background scraping job for selected internship sources",
+    ("/scrape", "GET"): "Lists all recent scraping jobs and their overall execution status",
+    "/scrape/{job_id}": "Polls status, progress, and stats of a specific scraping job",
+    "/docs": "Interactive Swagger UI documentation and API testing dashboard",
+    "/redoc": "ReDoc API reference documentation page",
+    "/openapi.json": "Raw OpenAPI JSON schema definition of the API",
+    "/docs/oauth2-redirect": "OAuth2 authentication redirect callback for Swagger UI",
+}
+
+@app.on_event("startup")
+def print_routes():
+    print("\n" + "=" * 105)
+    print(" >>> iFind Scraper API - Registered Endpoints & Descriptions")
+    print("=" * 105)
+    print(f"  {'HTTP METHOD':<14} {'ENDPOINT PATH':<24} {'DESCRIPTION'}")
+    print("  " + "-" * 101)
+
+    for route in app.routes:
+        if hasattr(route, "methods") and hasattr(route, "path"):
+            methods = ", ".join(sorted(route.methods))
+            path = route.path
+
+            primary_method = "POST" if "POST" in route.methods else "GET"
+            desc = (
+                ENDPOINT_DESCRIPTIONS.get((path, primary_method))
+                or ENDPOINT_DESCRIPTIONS.get(path)
+            )
+            if not desc and getattr(route, "endpoint", None) and route.endpoint.__doc__:
+                desc = route.endpoint.__doc__.strip().splitlines()[0].strip()
+            desc = desc or "No description available"
+
+            print(f"  {methods:<14} {path:<24} {desc}")
+
+    print("=" * 105 + "\n")
+
+
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 7860))   # HF Spaces default port
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+
