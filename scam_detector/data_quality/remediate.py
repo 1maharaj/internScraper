@@ -194,7 +194,8 @@ def flag_mislabeled_company(record: dict[str, Any]) -> tuple[dict[str, Any], Fla
     ``company_suspect``  : True
     ``company_source``   : "category_leak"
     ``company_match_via``: which check matched (``"hardcoded_list"``,
-                           ``"skills_field"``, or ``"tags_field"``)
+                           ``"skills_field"``, ``"tags_field"``, or
+                           ``"title_match"``)
     """
     flags: Flags = {}
     company_raw: str = record.get("company") or ""
@@ -224,6 +225,24 @@ def flag_mislabeled_company(record: dict[str, Any]) -> tuple[dict[str, Any], Fla
         flags["company_suspect"] = True
         flags["company_source"] = "category_leak"
         flags["company_match_via"] = "tags_field"
+        return record, flags
+
+    # Check 4 — company field is identical to the internship's own title
+    # (optionally with a trailing 4-digit year, e.g. "... Internship 2026").
+    # Real-data example: company="Electric Vehicle Design Internship",
+    # name="Electric Vehicle Design Internship 2026" — no real employer name
+    # exists at all, the "company" is just the generic role/course name.
+    # Exact-match only (after year-stripping) to avoid the false-positive
+    # risk of a broader substring check (many real company names ARE a
+    # legitimate substring of their own internship's title, e.g. "TCS" in
+    # "TCS Digital Internship").
+    title_raw: str = record.get("name") or record.get("title") or ""
+    title_lc = title_raw.strip().lower()
+    title_no_year = re.sub(r"\s+\d{4}\s*$", "", title_lc).strip()
+    if title_lc and company_lc in (title_lc, title_no_year):
+        flags["company_suspect"] = True
+        flags["company_source"] = "category_leak"
+        flags["company_match_via"] = "title_match"
         return record, flags
 
     return record, flags
@@ -291,6 +310,36 @@ def flag_missing_deadline(record: dict[str, Any]) -> tuple[dict[str, Any], Flags
     # Treat None, empty string, and missing key all as absent
     if not deadline:
         flags["deadline_missing"] = True
+
+    return record, flags
+
+
+def flag_openings_defaulted(record: dict[str, Any]) -> tuple[dict[str, Any], Flags]:
+    """
+    Flag listings where ``openings`` equals 1 — the scraper's universal
+    fallback default (``format_internship._extract_openings``) when no real
+    opening count could be scraped from the source platform.
+
+    Empirically, 100% of a real 2,010-record corpus (Internshala + Unstop)
+    show ``openings == 1``, which is not plausible as a genuine value for
+    every single posting — it is a scraper limitation, not real data. An
+    ``openings_zscore`` computed over a field with zero real variance is
+    silently and confidently wrong (a fake "no anomaly here" signal), which
+    is worse than treating it as unknown. This mirrors the existing
+    ``deadline_missing`` philosophy: unknown, not silently safe.
+
+    The value is **not altered** — downstream code decides whether to
+    disable openings-based features entirely.
+
+    Flags emitted
+    -------------
+    ``openings_defaulted`` : True
+    """
+    flags: Flags = {}
+    openings = record.get("openings")
+
+    if openings == 1:
+        flags["openings_defaulted"] = True
 
     return record, flags
 
@@ -439,6 +488,7 @@ _FIXES = (
     flag_mislabeled_company,
     flag_degree_default,
     flag_missing_deadline,
+    flag_openings_defaulted,
     clean_responsibilities,
     flag_truncated_summary,
     flag_inferred_date,

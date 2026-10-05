@@ -22,3 +22,11 @@ build/
 .mypy_cache/
 htmlcov/
 .coverage
+*.sqlite
+whois_cache.sqlite
+
+# Secrets / generated output
+.env.local
+.env
+scored_internships.json
+

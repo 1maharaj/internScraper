@@ -92,6 +92,8 @@ _COMPLETENESS_CHECKS: list[tuple[str, Any]] = [
 def openings_zscore(
     record: dict[str, Any],
     peer_group_records: list[dict[str, Any]],
+    *,
+    min_peer_group_size: int = 2,
 ) -> float | None:
     """
     Compute a z-score for this record's ``openings`` count against peers.
@@ -109,13 +111,15 @@ def openings_zscore(
         Internship dict with ``openings`` key (int or None).
     peer_group_records:
         List of comparable internship dicts.
+    min_peer_group_size:
+        Minimum number of valid peer records required to calculate z-score.
 
     Returns
     -------
     float or None
         None when:
         - This record's openings is None/missing
-        - Fewer than 2 peers have non-None openings values
+        - Fewer than ``min_peer_group_size`` peers have non-None openings values
         - All peers have identical openings (σ = 0, would divide by zero)
     """
     own = record.get("openings")
@@ -129,14 +133,24 @@ def openings_zscore(
         if v is not None and isinstance(v, (int, float)):
             peer_vals.append(float(v))
 
-    if len(peer_vals) < 2:
+    if len(peer_vals) < min_peer_group_size:
         return None
 
     mu = statistics.mean(peer_vals)
     sigma = statistics.stdev(peer_vals)
 
     if sigma == 0.0:
-        return 0.0 if own_f == mu else None
+        # Peers have zero variance (e.g. a scraper field that never varies).
+        # Matching that degenerate constant is uninformative — we cannot tell
+        # anomalous from normal when nothing ever differs — so report
+        # unknown rather than a falsely confident "perfectly average" 0.0.
+        # But a record that DOES deviate from an otherwise-constant peer
+        # group is a genuine, strong signal (infinitely far from every
+        # peer), not something to discard as unknown.
+        if own_f == mu:
+            return None
+        sentinel = 10.0
+        return sentinel if own_f > mu else -sentinel
 
     return round((own_f - mu) / sigma, 4)
 

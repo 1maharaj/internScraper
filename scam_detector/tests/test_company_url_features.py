@@ -15,6 +15,8 @@ All URL fixtures come directly from internScraper/checkpoint_internships.json
 and web_scrapper/telegram scraper/all_channels_internships.json.
 """
 from __future__ import annotations
+from unittest.mock import patch
+
 import pytest
 
 from scam_detector.features.company_features import (
@@ -25,6 +27,9 @@ from scam_detector.features.company_features import (
     has_legal_suffix,
     company_posting_frequency,
     typosquat_brand_distance,
+    is_ngo_or_fundraising_sector,
+    build_lump_sum_stipend_index,
+    ngo_stipend_network_flag,
 )
 from scam_detector.features.url_features import (
     UrlFeatures,
@@ -666,3 +671,147 @@ class TestExtractCompanyUrlFeatures:
             flags={"company_suspect": True},
         )
         assert result.company.is_suspect is True
+
+
+# ===========================================================================
+# is_ngo_or_fundraising_sector / build_lump_sum_stipend_index / ngo_stipend_network_flag
+# ===========================================================================
+
+def _lump_sum(amount: float, currency: str = "INR") -> dict:
+    return {"type": "paid", "amount": amount, "currency": currency, "period": "lump_sum"}
+
+
+class TestIsNgoOrFundraisingSector:
+
+    def test_foundation_in_company_name(self) -> None:
+        assert is_ngo_or_fundraising_sector({"company": "NayePankh Foundation", "name": "Business Consultant"}) is True
+
+    def test_fundraising_in_title(self) -> None:
+        assert is_ngo_or_fundraising_sector({"company": "Acme Corp", "name": "Fundraising Internship"}) is True
+
+    def test_trust_in_company_name(self) -> None:
+        assert is_ngo_or_fundraising_sector({"company": "My Story Trust", "name": "HR Intern"}) is True
+
+    def test_ordinary_tech_company_not_flagged(self) -> None:
+        assert is_ngo_or_fundraising_sector({"company": "Razorpay", "name": "Backend Engineering Intern"}) is False
+
+    def test_empty_record_not_flagged(self) -> None:
+        assert is_ngo_or_fundraising_sector({}) is False
+
+    def test_ngo_keyword_in_tags(self) -> None:
+        assert is_ngo_or_fundraising_sector({"company": "Acme", "name": "Intern", "tags": ["csr", "internship"]}) is True
+
+
+class TestNgoStipendNetworkFlag:
+
+    def test_flags_when_3_plus_distinct_companies_share_amount(self) -> None:
+        remediated = [
+            ({"company": "NayePankh Foundation", "stipend": _lump_sum(15000)}, {}),
+            ({"company": "Basti Ki Pathshala Foundation", "stipend": _lump_sum(15000)}, {}),
+            ({"company": "Queens Of Change Foundation", "stipend": _lump_sum(15000)}, {}),
+        ]
+        index = build_lump_sum_stipend_index(remediated)
+        record = {"company": "NayePankh Foundation", "stipend": _lump_sum(15000)}
+        flagged, count = ngo_stipend_network_flag(record, index, min_distinct_companies=3)
+        assert flagged is True
+        assert count == 3
+
+    def test_does_not_flag_below_threshold(self) -> None:
+        remediated = [
+            ({"company": "NayePankh Foundation", "stipend": _lump_sum(15000)}, {}),
+            ({"company": "Basti Ki Pathshala Foundation", "stipend": _lump_sum(15000)}, {}),
+        ]
+        index = build_lump_sum_stipend_index(remediated)
+        record = {"company": "NayePankh Foundation", "stipend": _lump_sum(15000)}
+        flagged, count = ngo_stipend_network_flag(record, index, min_distinct_companies=3)
+        assert flagged is False
+        assert count == 2
+
+    def test_excludes_company_suspect_from_index(self) -> None:
+        # "career navigator" / "linkedin screen" style category-leak entries
+        # must not inflate the distinct-company count
+        remediated = [
+            ({"company": "NayePankh Foundation", "stipend": _lump_sum(15000)}, {}),
+            ({"company": "Basti Ki Pathshala Foundation", "stipend": _lump_sum(15000)}, {}),
+            ({"company": "career navigator", "stipend": _lump_sum(15000)}, {"company_suspect": True}),
+        ]
+        index = build_lump_sum_stipend_index(remediated)
+        record = {"company": "NayePankh Foundation", "stipend": _lump_sum(15000)}
+        flagged, count = ngo_stipend_network_flag(record, index, min_distinct_companies=3)
+        assert flagged is False
+        assert count == 2
+
+    def test_ignores_monthly_stipends(self) -> None:
+        monthly = {"type": "paid", "amount": 5000, "currency": "INR", "period": "monthly"}
+        remediated = [
+            ({"company": "A", "stipend": monthly}, {}),
+            ({"company": "B", "stipend": monthly}, {}),
+            ({"company": "C", "stipend": monthly}, {}),
+        ]
+        index = build_lump_sum_stipend_index(remediated)
+        record = {"company": "A", "stipend": monthly}
+        flagged, count = ngo_stipend_network_flag(record, index, min_distinct_companies=3)
+        assert flagged is False
+        assert count == 0
+
+    def test_ignores_unpaid_zero_amount(self) -> None:
+        unpaid = {"type": "unpaid", "amount": 0, "currency": "INR", "period": "monthly"}
+        remediated = [
+            ({"company": "A", "stipend": unpaid}, {}),
+            ({"company": "B", "stipend": unpaid}, {}),
+            ({"company": "C", "stipend": unpaid}, {}),
+        ]
+        index = build_lump_sum_stipend_index(remediated)
+        record = {"company": "A", "stipend": unpaid}
+        flagged, count = ngo_stipend_network_flag(record, index, min_distinct_companies=3)
+        assert flagged is False
+        assert count == 0
+
+    def test_empty_index_does_not_crash(self) -> None:
+        record = {"company": "A", "stipend": _lump_sum(15000)}
+        flagged, count = ngo_stipend_network_flag(record, {}, min_distinct_companies=3)
+        assert flagged is False
+        assert count == 0
+
+
+# ===========================================================================
+# WHOIS domain-age lookup gating (extract_company_url_features)
+# ===========================================================================
+#
+# domain_age_days was previously computed unconditionally for every record
+# (an expensive WHOIS lookup, SQLite-cached but still wasted network I/O)
+# yet never consumed by any rule or the anomaly model. Fixed to skip the
+# lookup entirely for platform-internal / known-ATS links, since those are
+# always old and identical across nearly every record on that platform -
+# zero discriminative value even if looked up. These tests verify the
+# gating itself, independent of whether the WHOIS call succeeds or fails.
+
+class TestDomainAgeLookupGating:
+
+    def test_whois_lookup_skipped_for_platform_internal_link(self) -> None:
+        # ANAKIN_RECORD uses an internshala.com apply link (platform-internal)
+        with patch(
+            "scam_detector.features.company_features.fetch_domain_age_days"
+        ) as mock_fetch:
+            extract_company_url_features(ANAKIN_RECORD)
+            mock_fetch.assert_not_called()
+
+    def test_whois_lookup_attempted_for_genuine_offplatform_domain(self) -> None:
+        # RAZORPAY_RECORD uses a direct employer domain (razorpay.com) -
+        # neither platform-internal nor a known ATS.
+        with patch(
+            "scam_detector.features.company_features.fetch_domain_age_days",
+            return_value=3650,
+        ) as mock_fetch:
+            result = extract_company_url_features(RAZORPAY_RECORD)
+            mock_fetch.assert_called_once()
+            assert result.company.domain_age_days == 3650
+
+    def test_whois_lookup_skipped_for_known_ats(self) -> None:
+        # GEMINI_RECORD uses boards.greenhouse.io (a known ATS, off-platform
+        # but not a company's own domain)
+        with patch(
+            "scam_detector.features.company_features.fetch_domain_age_days"
+        ) as mock_fetch:
+            extract_company_url_features(GEMINI_RECORD)
+            mock_fetch.assert_not_called()

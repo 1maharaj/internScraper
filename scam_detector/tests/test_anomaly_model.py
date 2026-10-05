@@ -235,6 +235,56 @@ class TestAnomalyModel:
         mags = [v for _, v in contribs]
         assert mags == sorted(mags, reverse=True)
 
+    def test_shap_vs_zscore_top_features_agreement(self) -> None:
+        """
+        Compare SHAP-based and z-score-approximation explanations on the same record
+        and confirm they broadly agree in direction (same top 2-3 features).
+        """
+        rng = np.random.default_rng(42)
+        columns = [f"feat_{i}" for i in range(12)]
+        normal_data = pd.DataFrame(rng.normal(0.0, 1.0, (100, 12)), columns=columns)
+        
+        # Inject an anomaly where feat_0, feat_1, feat_2 are extreme deviations
+        outlier_data = pd.DataFrame(
+            [[15.0, 12.0, 9.0] + [0.0] * 9],
+            columns=columns,
+            index=["outlier_1"],
+        )
+        full_df = pd.concat([normal_data, outlier_data])
+
+        model = AnomalyModel(random_state=42, n_estimators=100).fit(full_df)
+
+        shap_contribs, method_shap = model.explain_detailed(outlier_data.iloc[0], use_shap=True)
+        zscore_contribs, method_z = model.explain_detailed(outlier_data.iloc[0], use_shap=False)
+
+        assert method_shap == "shap"
+        assert method_z == "z_score_approximation"
+
+        shap_top3 = [name for name, _ in shap_contribs[:3]]
+        zscore_top3 = [name for name, _ in zscore_contribs[:3]]
+
+        # The top 3 features for this outlier are feat_0, feat_1, feat_2 in both methods
+        expected_top3 = {"feat_0", "feat_1", "feat_2"}
+        assert set(shap_top3) == expected_top3, f"SHAP top 3: {shap_top3}"
+        assert set(zscore_top3) == expected_top3, f"Z-score top 3: {zscore_top3}"
+
+    def test_explain_batch_matches_single(self) -> None:
+        records, vectors = self._synthetic_corpus()
+        matrix = assemble_feature_matrix(records, vectors)
+        model = AnomalyModel(random_state=42).fit(matrix)
+
+        batch_shap = model.explain_batch(matrix, use_shap=True)
+        assert len(batch_shap) == len(matrix)
+
+        # Check that batch output for row 0 matches single explain
+        single_shap = model.explain(matrix.iloc[0], use_shap=True)
+        assert [name for name, _ in batch_shap[0][:5]] == [name for name, _ in single_shap[:5]]
+        np.testing.assert_allclose(
+            [val for _, val in batch_shap[0][:5]],
+            [val for _, val in single_shap[:5]],
+            rtol=1e-4,
+        )
+
     def test_fit_empty_raises(self) -> None:
         model = AnomalyModel()
         with pytest.raises(ValueError, match="empty"):

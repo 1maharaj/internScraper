@@ -41,6 +41,7 @@ _TEXT_FIELDS: tuple[str, ...] = (
     "artifact_count",
     "sensitive_info_requested",
     "boilerplate_similarity",
+    "scam_corpus_similarity",
 )
 
 _COMPANY_FIELDS: tuple[str, ...] = (
@@ -204,16 +205,55 @@ def assemble_feature_matrix(
     return pd.DataFrame(rows, index=index)
 
 
+import logging
+
+log = logging.getLogger("scam_detector.scoring.anomaly")
+
+try:
+    import shap
+    _SHAP_AVAILABLE = True
+except ImportError:
+    shap = None  # type: ignore[assignment]
+    _SHAP_AVAILABLE = False
+
+from scam_detector.config import Config, cfg as _default_cfg
+
+
 # ---------------------------------------------------------------------------
-# AnomalyModel — IsolationForest on tabular features
+# AnomalyModel — IsolationForest on tabular features with SHAP Explanations
 # ---------------------------------------------------------------------------
 
 
 class AnomalyModel:
     """
-    Unsupervised IsolationForest anomaly detector over assembled feature matrices.
+    Unsupervised IsolationForest anomaly detector over assembled feature matrices
+    with exact TreeSHAP explainability.
 
     Complements the rules engine when labeled fraud data is unavailable.
+
+    SHAP Explanation Architecture Note
+    ----------------------------------
+    In scikit-learn's IsolationForest, trees recursively partition feature space;
+    anomalous points have shorter average path lengths h(x).
+
+    ``shap.TreeExplainer`` natively evaluates IsolationForest via the TreeSHAP
+    algorithm in O(N * trees * depth) time, attributing how much each feature
+    reduces or increases the average tree path length.
+    - Negative SHAP on path length = feature isolates the sample faster (increases anomaly risk).
+    - Positive SHAP on path length = feature keeps the sample deeper in trees (normal).
+
+    We define feature anomaly contribution as:
+        contribution = - shap_value(path_length)
+    so that positive values directly represent risk-increasing factors.
+
+    Comparison with KernelExplainer:
+    ``shap.KernelExplainer`` is model-agnostic but requires hundreds of Monte Carlo
+    evaluations per record, running ~1,000x slower (~500ms-1s/row vs ~0.6ms/row for
+    TreeExplainer). TreeExplainer is therefore the optimal choice for real-time and
+    batch production usage.
+
+    A fast z-score approximation fallback is retained and toggleable via
+    ``cfg.anomaly.enable_shap`` / ``cfg.flags.enable_shap_anomaly_explanations``.
     """
 
     def __init__(
@@ -223,7 +263,9 @@ class AnomalyModel:
         contamination: float | str = "auto",
         random_state: int = 42,
         n_jobs: int = 1,
+        config: Config | None = None,
     ) -> None:
+        self._cfg = config or _default_cfg
         self._model = IsolationForest(
             n_estimators=n_estimators,
             contamination=contamination,
@@ -236,6 +278,7 @@ class AnomalyModel:
         self._train_std: np.ndarray | None = None
         self._raw_score_min: float = 0.0
         self._raw_score_max: float = 1.0
+        self._tree_explainer: Any | None = None
 
     @property
     def is_fitted(self) -> bool:
@@ -250,7 +293,7 @@ class AnomalyModel:
         Train IsolationForest on the numeric feature vectors.
 
         Also stores per-feature mean/std of the training distribution for the
-        lightweight ``explain`` approximation.
+        fallback z-score approximation and resets the cached TreeExplainer.
         """
         if feature_matrix.empty:
             raise ValueError("Cannot fit AnomalyModel on an empty feature matrix.")
@@ -272,8 +315,23 @@ class AnomalyModel:
             # Degenerate case: all points equally anomalous — keep unit range
             self._raw_score_max = self._raw_score_min + 1.0
 
+        self._tree_explainer = None
         self._fitted = True
         return self
+
+    def _get_tree_explainer(self) -> Any | None:
+        """Lazy-initialize and cache shap.TreeExplainer."""
+        if not self._fitted:
+            return None
+        if not _SHAP_AVAILABLE:
+            return None
+        if self._tree_explainer is None:
+            try:
+                self._tree_explainer = shap.TreeExplainer(self._model)
+            except Exception as exc:
+                log.warning("Failed to initialize shap.TreeExplainer: %s", exc)
+                self._tree_explainer = None
+        return self._tree_explainer
 
     def _align(self, feature_matrix: pd.DataFrame) -> np.ndarray:
         if not self._fitted:
@@ -304,18 +362,49 @@ class AnomalyModel:
         raw = -self._model.decision_function(values)
         return self._normalize_raw(raw)
 
-    def explain(self, record_features: pd.Series | Mapping[str, Any]) -> list[tuple[str, float]]:
+    def explain(
+        self,
+        record_features: pd.Series | Mapping[str, Any],
+        use_shap: bool | None = None,
+    ) -> list[tuple[str, float]]:
         """
-        Approximate per-feature contribution via |z-score| vs training distribution.
+        Return per-feature contributions to the anomaly score, sorted by impact.
 
-        Sorted by magnitude (largest deviation first).  This is a lightweight
-        stand-in for full SHAP-based explainability.
+        Parameters
+        ----------
+        record_features:
+            Series or dict-like mapping of feature names to values.
+        use_shap:
+            If True, use real SHAP TreeExplainer values.
+            If False, use the fast z-score approximation.
+            If None (default), respects ``cfg.anomaly.enable_shap`` and
+            ``cfg.flags.enable_shap_anomaly_explanations``.
 
-        TODO: upgrade to real SHAP values via the ``shap`` library once the
-        pipeline is stable and the performance cost is justified.
+        Returns
+        -------
+        list[tuple[str, float]]
+            List of (feature_name, contribution) tuples sorted descending by
+            anomaly contribution.
+        """
+        contributions, _method = self.explain_detailed(record_features, use_shap=use_shap)
+        return contributions
+
+    def explain_detailed(
+        self,
+        record_features: pd.Series | Mapping[str, Any],
+        use_shap: bool | None = None,
+    ) -> tuple[list[tuple[str, float]], str]:
+        """
+        Return per-feature contributions along with the explanation method used ('shap' or 'z_score_approximation').
         """
         if not self._fitted or self._train_mean is None or self._train_std is None:
             raise RuntimeError("AnomalyModel.explain called before fit().")
+
+        if use_shap is None:
+            use_shap = bool(
+                getattr(self._cfg.anomaly, "enable_shap", True)
+                and getattr(self._cfg.flags, "enable_shap_anomaly_explanations", True)
+            )
 
         if isinstance(record_features, pd.Series):
             series = record_features.reindex(self._feature_columns, fill_value=0.0)
@@ -329,14 +418,93 @@ class AnomalyModel:
             .replace([np.inf, -np.inf], 0.0)
             .fillna(0.0)
             .to_numpy(dtype=np.float64)
+            .reshape(1, -1)
         )
-        z = (values - self._train_mean) / self._train_std
+
+        if use_shap and _SHAP_AVAILABLE:
+            explainer = self._get_tree_explainer()
+            if explainer is not None:
+                try:
+                    shap_raw = explainer.shap_values(values)
+                    # shap_raw is array of shape (1, n_features)
+                    shap_row = shap_raw[0] if isinstance(shap_raw, (list, np.ndarray)) else np.asarray(shap_raw)
+                    if shap_row.ndim > 1:
+                        shap_row = shap_row[0]
+                    # In IsolationForest, negative path length SHAP = positive anomaly risk contribution
+                    contributions = [
+                        (col, float(-s_i))
+                        for col, s_i in zip(self._feature_columns, shap_row)
+                    ]
+                    contributions.sort(key=lambda item: item[1], reverse=True)
+                    return contributions, "shap"
+                except Exception as exc:
+                    log.warning("SHAP explanation failed (%s) — falling back to z-score approximation", exc)
+
+        # Fallback: z-score approximation
+        z = (values[0] - self._train_mean) / self._train_std
         contributions = [
             (col, float(abs(z_i)))
             for col, z_i in zip(self._feature_columns, z)
         ]
         contributions.sort(key=lambda item: item[1], reverse=True)
-        return contributions
+        return contributions, "z_score_approximation"
+
+    def explain_batch(
+        self,
+        feature_matrix: pd.DataFrame,
+        use_shap: bool | None = None,
+    ) -> list[list[tuple[str, float]]]:
+        """
+        Batch-compute explanations across all rows in ``feature_matrix``.
+
+        Leverages C++ vectorized batch TreeSHAP evaluation for speed.
+        """
+        if not self._fitted or self._train_mean is None or self._train_std is None:
+            raise RuntimeError("AnomalyModel.explain_batch called before fit().")
+
+        if feature_matrix.empty:
+            return []
+
+        if use_shap is None:
+            use_shap = bool(
+                getattr(self._cfg.anomaly, "enable_shap", True)
+                and getattr(self._cfg.flags, "enable_shap_anomaly_explanations", True)
+            )
+
+        values = self._align(feature_matrix)
+        n_rows = values.shape[0]
+
+        if use_shap and _SHAP_AVAILABLE:
+            explainer = self._get_tree_explainer()
+            if explainer is not None:
+                try:
+                    shap_raw = explainer.shap_values(values)
+                    shap_matrix = np.asarray(shap_raw)
+                    results: list[list[tuple[str, float]]] = []
+                    for i in range(n_rows):
+                        row_shap = shap_matrix[i]
+                        # In IsolationForest, negative path length SHAP = positive anomaly risk contribution
+                        contributions = [
+                            (col, float(-s_i))
+                            for col, s_i in zip(self._feature_columns, row_shap)
+                        ]
+                        contributions.sort(key=lambda item: item[1], reverse=True)
+                        results.append(contributions)
+                    return results
+                except Exception as exc:
+                    log.warning("Batch SHAP explanation failed (%s) — falling back to z-score", exc)
+
+        # Fallback: batch z-score approximation
+        z_matrix = (values - self._train_mean) / self._train_std
+        results = []
+        for i in range(n_rows):
+            contributions = [
+                (col, float(abs(z_matrix[i, j])))
+                for j, col in enumerate(self._feature_columns)
+            ]
+            contributions.sort(key=lambda item: item[1], reverse=True)
+            results.append(contributions)
+        return results
 
 
 # ---------------------------------------------------------------------------

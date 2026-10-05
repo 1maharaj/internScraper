@@ -96,6 +96,190 @@ _ZSCORE_LOW = -2.0   # more than 2 SD below mean   → suspiciously low
 
 
 # ---------------------------------------------------------------------------
+# Category Extraction Helpers for Peer Grouping
+# ---------------------------------------------------------------------------
+
+
+def _as_str_set(value: Any) -> set[str]:
+    if not value:
+        return set()
+    if isinstance(value, str):
+        return {value.strip().lower()} if value.strip() else set()
+    if isinstance(value, list):
+        return {str(v).strip().lower() for v in value if v and str(v).strip()}
+    return set()
+
+
+import re
+
+def get_role_subcategory(record: dict[str, Any]) -> str:
+    """
+    Derive fine-grained role sub-category using a Title-First classifier,
+    falling back to field/skills/tags if the title is generic.
+
+    Sub-categories:
+      - ai_ml
+      - data_science
+      - hardware_embedded
+      - qa_support
+      - marketing_sales
+      - design
+      - finance_ops
+      - software_dev
+      - general
+    """
+    if subcat := record.get("role_subcategory"):
+        return str(subcat).strip().lower()
+    if cat := record.get("role_category"):
+        cat_str = str(cat).strip().lower()
+        if cat_str in {
+            "ai_ml", "software_dev", "data_science", "qa_support",
+            "hardware_embedded", "marketing_sales", "design", "finance_ops"
+        }:
+            return cat_str
+
+    title = str(record.get("name") or record.get("title") or "").lower()
+
+    def _collect_tokens(field_key: str) -> list[str]:
+        val = record.get(field_key)
+        if not val:
+            return []
+        if isinstance(val, str):
+            return [val.strip().lower()]
+        if isinstance(val, list):
+            return [str(v).strip().lower() for v in val if v]
+        return []
+
+    tags_and_fields = (
+        _collect_tokens("field") +
+        _collect_tokens("skills") +
+        _collect_tokens("tags")
+    )
+    combined_text = title + " " + " ".join(tags_and_fields)
+
+    def matches(text: str, patterns: list[str]) -> bool:
+        for p in patterns:
+            if re.search(r"\b" + re.escape(p) + r"\b", text):
+                return True
+        return False
+
+    # Title-First Priority Matching
+    if matches(title, ["ai", "artificial intelligence", "machine learning", "ml", "deep learning", "nlp", "llm", "genai", "generative ai", "computer vision", "neural network"]):
+        return "ai_ml"
+
+    if matches(title, ["data science", "data scientist", "data analyst", "data analytics", "data engineering", "data engineer", "bi analyst"]):
+        return "data_science"
+
+    if matches(title, ["hardware", "embedded", "vlsi", "robotics", "iot", "firmware", "fpga"]):
+        return "hardware_embedded"
+
+    if matches(title, ["qa", "quality assurance", "testing", "test engineer", "it support", "helpdesk", "sysadmin", "technical support"]):
+        return "qa_support"
+
+    if matches(title, ["marketing", "sales", "business development", "bde", "bda", "social media", "seo", "sem", "digital marketing", "content marketing", "lead generation", "growth", "market research"]):
+        return "marketing_sales"
+
+    if matches(title, ["design", "designer", "graphic", "ui", "ux", "ui/ux", "video editing", "video creation", "animator"]):
+        return "design"
+
+    if matches(title, ["finance", "accounting", "financial analyst", "hr", "human resources", "recruiter", "operations", "logistics", "supply chain", "executive assistant", "data entry"]):
+        return "finance_ops"
+
+    if matches(title, ["software", "software engineer", "backend", "frontend", "full stack", "fullstack", "web dev", "web developer", "mobile app", "android", "ios", "developer", "python", "java", "c++", "golang", "devops", "cloud", "aws"]):
+        return "software_dev"
+
+    # Secondary Check on combined text (skills / fields / tags) if title is generic
+    if matches(combined_text, ["ai", "artificial intelligence", "machine learning", "ml", "deep learning", "nlp", "llm", "genai", "generative ai", "computer vision"]):
+        return "ai_ml"
+
+    if matches(combined_text, ["data science", "data scientist", "data analyst", "data analytics", "data engineering", "data engineer"]):
+        return "data_science"
+
+    if matches(combined_text, ["hardware", "embedded", "vlsi", "robotics", "iot", "firmware"]):
+        return "hardware_embedded"
+
+    if matches(combined_text, ["qa", "quality assurance", "testing engineer", "test engineer", "it support"]):
+        return "qa_support"
+
+    if matches(combined_text, ["marketing", "sales", "business development", "bde", "bda", "social media", "seo"]):
+        return "marketing_sales"
+
+    if matches(combined_text, ["design", "designer", "graphic", "ui", "ux"]):
+        return "design"
+
+    if matches(combined_text, ["finance", "accounting", "hr", "human resources", "operations"]):
+        return "finance_ops"
+
+    if matches(combined_text, ["software", "backend", "frontend", "full stack", "web development", "developer"]):
+        return "software_dev"
+
+    return "general"
+
+
+def get_broad_category(subcat: str) -> str:
+    """Map fine-grained sub-category to broad role family for secondary fallbacks."""
+    tech_subcats = {"ai_ml", "software_dev", "data_science", "qa_support", "hardware_embedded"}
+    if subcat in tech_subcats:
+        return "tech"
+    return subcat
+
+
+def get_remote_status(record: dict[str, Any]) -> str:
+    """Derive remote status string ('remote', 'on_site', or 'unknown')."""
+    if "isRemote" in record and record["isRemote"] is not None:
+        return "remote" if bool(record["isRemote"]) else "on_site"
+    loc = str(record.get("location") or record.get("city") or "").lower()
+    if any(k in loc for k in ["remote", "work from home", "wfh"]):
+        return "remote"
+    if loc:
+        return "on_site"
+    return "unknown"
+
+
+def get_role_category(record: dict[str, Any]) -> str:
+    """Backwards compatible broad role category extractor."""
+    subcat = get_role_subcategory(record)
+    return get_broad_category(subcat)
+
+
+def get_city_tier(record: dict[str, Any]) -> str:
+    """Derive city_tier from explicit field, isRemote, or location/city."""
+    if tier := record.get("city_tier"):
+        return str(tier).strip().lower()
+    if record.get("isRemote"):
+        return "remote"
+    loc = str(record.get("location") or record.get("city") or "").lower()
+    tier1 = {"mumbai", "delhi", "bengaluru", "bangalore", "hyderabad", "chennai", "kolkata", "pune", "ahmedabad"}
+    if any(city in loc for city in tier1):
+        return "tier_1"
+    if loc:
+        return "tier_2"
+    return "unknown"
+
+
+def get_company_size_tier(record: dict[str, Any]) -> str:
+    """Derive company_size_tier from explicit field or company_size / employees."""
+    if tier := record.get("company_size_tier"):
+        return str(tier).strip().lower()
+    size = record.get("company_size") or record.get("employees")
+    if isinstance(size, (int, float)):
+        if size < 50:
+            return "startup"
+        if size < 500:
+            return "midsize"
+        return "enterprise"
+    if isinstance(size, str):
+        size_lc = size.lower()
+        if any(k in size_lc for k in ["1-10", "11-50", "startup", "small"]):
+            return "startup"
+        if any(k in size_lc for k in ["51-200", "201-500", "mid"]):
+            return "midsize"
+        if any(k in size_lc for k in ["500+", "1000", "large", "enterprise"]):
+            return "enterprise"
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Function 1 — normalize_stipend_to_hourly_inr
 # ---------------------------------------------------------------------------
 
@@ -191,6 +375,8 @@ def normalize_stipend_to_hourly_inr(
 def stipend_zscore(
     record: dict[str, Any],
     peer_group_records: list[dict[str, Any]],
+    *,
+    min_peer_group_size: int = 2,
 ) -> float | None:
     """
     Compute a z-score for this record's normalised stipend against *peer_group_records*.
@@ -208,7 +394,9 @@ def stipend_zscore(
     record:
         Single internship dict with ``stipend`` and ``duration`` keys.
     peer_group_records:
-        List of comparable internship dicts (same field / isRemote category).
+        List of comparable internship dicts.
+    min_peer_group_size:
+        Minimum number of valid peer stipends required to calculate z-score.
 
     Returns
     -------
@@ -216,7 +404,7 @@ def stipend_zscore(
         Z-score (can be negative for below-average stipends).
     None
         Returned when:
-        - Fewer than 2 peers have normalisable stipends (no meaningful σ)
+        - Fewer than ``min_peer_group_size`` peers have normalisable stipends
         - This record's own stipend is ``performance-based`` (not a number)
         - This record's own stipend is missing/unparseable
     """
@@ -236,8 +424,8 @@ def stipend_zscore(
         if h is not None:
             peer_hourlies.append(h)
 
-    if len(peer_hourlies) < 2:
-        return None  # not enough data for a meaningful z-score
+    if len(peer_hourlies) < min_peer_group_size:
+        return None  # not enough data for a stable z-score
 
     mu = statistics.mean(peer_hourlies)
     sigma = statistics.stdev(peer_hourlies)

@@ -210,6 +210,40 @@ class TestRenderExplanation:
         assert isinstance(result, ScamScoreResult)
         assert result.explanation_summary
 
+    def test_render_explanation_with_shap_labels(self) -> None:
+        from scam_detector.scoring.explain import render_explanation
+
+        engine = RiskEngine()
+        rules = _rules(_finding("typosquat_domain", weight=0.50))
+        result = engine.score_record(
+            record={},
+            rule_result=rules,
+            anomaly_score=0.45,
+            confidence_score=0.90,
+            feature_contributions=[("text__urgency_score", 0.3541), ("url__domain_entropy", 0.1234)],
+            explanation_method="shap",
+        )
+        report = render_explanation(result)
+        assert "Top contributing anomaly features (SHAP values):" in report
+        assert "text__urgency_score: +0.3541 (SHAP)" in report
+
+    def test_render_explanation_with_zscore_labels(self) -> None:
+        from scam_detector.scoring.explain import render_explanation
+
+        engine = RiskEngine()
+        rules = _rules(_finding("typosquat_domain", weight=0.50))
+        result = engine.score_record(
+            record={},
+            rule_result=rules,
+            anomaly_score=0.45,
+            confidence_score=0.90,
+            feature_contributions=[("text__urgency_score", 3.54), ("url__domain_entropy", 1.23)],
+            explanation_method="z_score_approximation",
+        )
+        report = render_explanation(result)
+        assert "Top contributing anomaly features (|z-score| approx):" in report
+        assert "text__urgency_score: 3.5400 (z-score)" in report
+
 
 class TestBlendAndThresholds:
     def test_high_blended_score_blocks(self) -> None:
@@ -227,3 +261,161 @@ class TestBlendAndThresholds:
         assert result.scam_score >= 70.0
         assert result.decision == "block"
         assert result.hard_disqualifying_forced is False
+
+
+class TestSupervisedBlendingAndCalibration:
+    def test_supervised_score_blending_when_enabled(self) -> None:
+        cfg = Config(
+            blend_weights=BlendWeights(
+                rules_weight=0.50,
+                anomaly_weight=0.25,
+                supervised_weight=0.25,
+            )
+        )
+        engine = RiskEngine(cfg)
+        rules = _rules(_finding("typosquat_domain", weight=0.60))
+
+        # rules_score = 0.60, anomaly = 0.20, supervised = 0.80
+        # Blend = 0.50*0.60 + 0.25*0.20 + 0.25*0.80 = 0.30 + 0.05 + 0.20 = 0.55
+        result = engine.score_record(
+            record={},
+            rule_result=rules,
+            anomaly_score=0.20,
+            confidence_score=0.90,
+            supervised_score=0.80,
+        )
+        assert result.supervised_score == 0.80
+        assert abs(result.scam_score - 55.0) < 1.0
+
+    def test_supervised_score_ignored_when_weight_zero(self) -> None:
+        cfg = Config(
+            blend_weights=BlendWeights(
+                rules_weight=0.60,
+                anomaly_weight=0.40,
+                supervised_weight=0.0,
+            )
+        )
+        engine = RiskEngine(cfg)
+        rules = _rules(_finding("typosquat_domain", weight=0.50))
+
+        # rules_score = 0.50, anomaly = 0.50 -> blended = 0.50 -> 50.0
+        result = engine.score_record(
+            record={},
+            rule_result=rules,
+            anomaly_score=0.50,
+            confidence_score=0.90,
+            supervised_score=0.99,  # Provided but weight is 0.0
+        )
+        assert result.supervised_score is None
+        assert abs(result.scam_score - 50.0) < 1.0
+
+    def test_calibrator_integration(self, tmp_path) -> None:
+        from scam_detector.scoring.calibration import ScoreCalibrator
+
+        raw_scores = [0.1 * i for i in range(10)] * 5
+        labels = [0 if s < 0.5 else 1 for s in raw_scores]
+        calibrator = ScoreCalibrator(min_samples=10).fit(raw_scores, labels)
+
+        engine = RiskEngine(calibrator=calibrator)
+        rules = _rules()
+
+        result = engine.score_record(
+            record={},
+            rule_result=rules,
+            anomaly_score=0.20,
+            confidence_score=0.90,
+        )
+        assert 0.0 <= result.scam_score <= 100.0
+
+
+class TestSourceConditionedConfidence:
+    def test_unseen_source_fallback(self) -> None:
+        cfg = Config(
+            confidence=ConfidenceConfig(
+                enable_source_conditioning=True,
+                source_baseline_path="nonexistent_baselines_file.json",
+            )
+        )
+        features = FeatureVector(
+            structural=StructuralFeatures(field_completeness=0.50),
+        )
+        score_conditioned = compute_confidence_score(
+            {"source": "new_unseen_source", "flags": {}},
+            features,
+            config=cfg,
+        )
+
+        cfg_disabled = Config(
+            confidence=ConfidenceConfig(
+                enable_source_conditioning=False,
+            )
+        )
+        score_disabled = compute_confidence_score(
+            {"source": "new_unseen_source", "flags": {}},
+            features,
+            config=cfg_disabled,
+        )
+        assert score_conditioned == score_disabled
+
+    def test_existing_source_scaling(self, tmp_path) -> None:
+        import json
+        from scam_detector.scoring.risk_engine import clear_baselines_cache
+        clear_baselines_cache()
+
+        baseline_file = tmp_path / "test_source_baselines.json"
+        baselines = {
+            "unstop": {
+                "mean_completeness": 0.50,
+                "count": 100
+            }
+        }
+        with open(baseline_file, "w", encoding="utf-8") as fh:
+            json.dump(baselines, fh)
+
+        cfg = Config(
+            confidence=ConfidenceConfig(
+                enable_source_conditioning=True,
+                source_baseline_path=str(baseline_file),
+                global_completeness_target=0.75,
+            )
+        )
+        features = FeatureVector(
+            structural=StructuralFeatures(field_completeness=0.50),
+        )
+
+        score_conditioned = compute_confidence_score(
+            {"source": "unstop", "flags": {}},
+            features,
+            config=cfg,
+        )
+
+        cfg_disabled = Config(
+            confidence=ConfidenceConfig(
+                enable_source_conditioning=False,
+            )
+        )
+        score_disabled = compute_confidence_score(
+            {"source": "unstop", "flags": {}},
+            features,
+            config=cfg_disabled,
+        )
+
+        # Expected values depend on whether the optional sentence-transformers
+        # dependency is installed: compute_confidence_score applies an extra
+        # *0.80 penalty when it's missing (see its SBERT-availability check).
+        # Hardcoding one environment's constants here made this test flake
+        # depending on the machine it ran on — derive the multiplier instead.
+        from scam_detector.features.text_features import _sbert_model
+        sbert_penalty = 1.0 if _sbert_model() is not None else 0.80
+
+        # completeness (0.50) * (global_target 0.75 / source mean 0.50) = 0.75
+        expected_conditioned = round(0.75 * sbert_penalty, 4)
+        # source-conditioning disabled → completeness passes through unscaled
+        expected_disabled = round(0.50 * sbert_penalty, 4)
+
+        assert score_conditioned > score_disabled
+        assert abs(score_conditioned - expected_conditioned) < 1e-4
+        assert abs(score_disabled - expected_disabled) < 1e-4
+
+        clear_baselines_cache()
+

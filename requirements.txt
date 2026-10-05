@@ -16,6 +16,18 @@ cohere==5.15.0
 # MongoDB
 pymongo==4.12.1
 
+# scam_detector (SBERT/torch/shap intentionally omitted: it falls back to
+# lexical duplicate detection and z-score explanations on its own)
+pydantic>=2.7
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.4
+rapidfuzz>=3.9
+tldextract>=5.1
+networkx>=3.2
+python-Levenshtein>=0.25
+python-whois>=0.9
+
 # Env
 python-dotenv==1.1.0
 

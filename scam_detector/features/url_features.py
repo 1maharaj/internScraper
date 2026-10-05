@@ -26,6 +26,7 @@ neutral-to-positive signals.
 
 from __future__ import annotations
 
+from functools import lru_cache
 import math
 import re
 from typing import Any
@@ -150,6 +151,7 @@ _LOW_RISK_TLDS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 
+@lru_cache(maxsize=4096)
 def _extract(url: str) -> tuple[str, str, str]:
     """
     Return (subdomain, domain, suffix/tld) using tldextract.

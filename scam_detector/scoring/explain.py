@@ -69,6 +69,10 @@ class ScamScoreResult(BaseModel):
         default_factory=list,
         description="(feature_name, contribution) pairs, typically from anomaly explain",
     )
+    explanation_method: str = Field(
+        default="shap",
+        description="Method used for top_contributing_features ('shap' or 'z_score_approximation')",
+    )
     explanation_summary: str = Field(
         default="",
         description="Short human-readable sentence summarising the verdict",
@@ -79,6 +83,8 @@ class ScamScoreResult(BaseModel):
     triggered_rule_findings: list[RuleFinding] = Field(default_factory=list)
     rules_score: float = Field(default=0.0, ge=0.0, le=1.0)
     anomaly_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    supervised_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    reputation_score: float | None = Field(default=None, ge=0.0, le=1.0)
     hard_disqualifying_forced: bool = Field(
         default=False,
         description="True when decision was forced by hard-disqualifying rule policy",
@@ -165,11 +171,15 @@ def render_explanation(result: ScamScoreResult) -> str:
         ),
         f"  Rules (0–1): {result.rules_score:.3f}   "
         f"Anomaly (0–1): {result.anomaly_score:.3f}",
+    ]
+    if result.reputation_score is not None:
+        lines.append(f"  Reputation (0–1): {result.reputation_score:.3f}")
+    lines.extend([
         "────────────────────────────────────────────────────────────",
         f"  Summary: {result.explanation_summary or '(none)'}",
         "────────────────────────────────────────────────────────────",
         "  Triggered rules:",
-    ]
+    ])
 
     findings = result.triggered_rule_findings
     if not findings and result.triggered_rules:
@@ -187,13 +197,21 @@ def render_explanation(result: ScamScoreResult) -> str:
                 lines.append(f"        {finding.explanation}")
 
     lines.append("────────────────────────────────────────────────────────────")
-    lines.append("  Top contributing anomaly features:")
     top5 = list(result.top_contributing_features[:5])
-    if not top5:
-        lines.append("    (none provided)")
+    if result.explanation_method == "shap":
+        lines.append("  Top contributing anomaly features (SHAP values):")
+        if not top5:
+            lines.append("    (none provided)")
+        else:
+            for i, (name, value) in enumerate(top5, start=1):
+                lines.append(f"    {i}. {name}: {value:+.4f} (SHAP)")
     else:
-        for i, (name, value) in enumerate(top5, start=1):
-            lines.append(f"    {i}. {name}: {value:.4f}")
+        lines.append("  Top contributing anomaly features (|z-score| approx):")
+        if not top5:
+            lines.append("    (none provided)")
+        else:
+            for i, (name, value) in enumerate(top5, start=1):
+                lines.append(f"    {i}. {name}: {value:.4f} (z-score)")
 
     if result.confidence_level == "low" or result.low_confidence_forced_review:
         lines.append("────────────────────────────────────────────────────────────")

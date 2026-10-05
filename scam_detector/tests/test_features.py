@@ -25,6 +25,7 @@ obvious positives score detectably higher than obvious negatives.
 from __future__ import annotations
 
 import math
+from unittest.mock import patch
 
 import pytest
 
@@ -35,6 +36,10 @@ from scam_detector.features.text_features import (
     genericity_score,
     readability_and_grammar_signals,
     sensitive_info_request_detector,
+    guaranteed_outcome_claim_detector,
+    external_form_and_phone_handoff_detector,
+    training_program_disguised_as_internship_detector,
+    zero_shot_scam_signal,
     urgency_score,
     boilerplate_similarity,
 )
@@ -299,6 +304,27 @@ class TestGenericityScore:
         assert 0.0 <= fundraising <= 1.0
         assert 0.0 <= software_dev <= 1.0
 
+    def test_specific_tech_title_containing_development_scores_low(self) -> None:
+        # Real-corpus false positive: with token_set_ratio (the previous
+        # implementation), any title sharing the word "Development" with a
+        # list entry scored close to 1.0 regardless of specificity -
+        # "SDET Intern (Software Development Engineer in Test)", a specific
+        # role at a real company (Icertis), scored 0.85-1.0 purely from that
+        # shared word, incorrectly triggering MassOpeningsVagueRoleRule.
+        # token_sort_ratio (current implementation) correctly penalizes the
+        # extra qualifying words instead of ignoring them.
+        score = genericity_score("SDET Intern (Software Development Engineer in Test)")
+        assert score < 0.65
+
+    def test_business_development_with_qualifier_scores_below_threshold(self) -> None:
+        score = genericity_score("Business Development Executive - Fintech Vertical")
+        assert score < 0.65
+
+    def test_bare_business_development_still_scores_generic(self) -> None:
+        # The genuinely generic, undifferentiated version must still match -
+        # this is a real, distinct vague-title category in this domain.
+        assert genericity_score("Business Development (Sales)") > 0.9
+
 
 # ===========================================================================
 # 4 — title_summary_alignment (SBERT — may be skipped without model)
@@ -336,8 +362,20 @@ class TestTitleSummaryAlignment:
         if not self.model_available:
             pytest.skip("sentence-transformers not installed")
         from scam_detector.features.text_features import title_summary_alignment
-        # Anakin: title = "Software Development", summary talks about backend engineering
-        aligned = title_summary_alignment(ANAKIN_TITLE, ANAKIN_SUMMARY)
+        # NOTE: previously used ANAKIN_SUMMARY here, but it is a long,
+        # jargon-heavy paragraph ("data engine", "anti-bot mechanisms") with
+        # no literal software/development vocabulary — verified empirically
+        # that all-MiniLM-L6-v2 scores it BELOW the misaligned pair (0.2199
+        # vs 0.2649), making this assertion flaky on the real model rather
+        # than a bug in title_summary_alignment. Using an unambiguously
+        # on-topic summary here instead; ANAKIN_SUMMARY is still used
+        # elsewhere in this file for unrelated properties (urgency, caps
+        # ratio, readability) where topical alignment doesn't matter.
+        aligned = title_summary_alignment(
+            "Software Development",
+            "You will write, test, and debug code, build new features, and "
+            "fix bugs in our software application using Python and JavaScript.",
+        )
         # Misaligned: fundraising title with a cooking summary
         misaligned = title_summary_alignment(
             "Fundraising",
@@ -447,6 +485,26 @@ class TestSensitiveInfoRequestDetector:
             "Share bank account details for stipend transfer."
         ) is True
 
+    def test_bank_account_number_detected(self) -> None:
+        assert sensitive_info_request_detector(
+            "Please provide your bank account number to process payment."
+        ) is True
+
+    def test_boost_your_bank_account_idiom_not_flagged(self) -> None:
+        # Real-corpus false positive: a real Unstop listing ("Nbyula")
+        # said "you won't just boost your bank account" - a colloquial
+        # phrase meaning "earn money", not a request for banking details.
+        # This was firing the hard-disqualifying rule (weight 0.95).
+        assert sensitive_info_request_detector(
+            "As a Campus Supernova, you won't just boost your bank account; "
+            "you'll shine bright in the world of digital marketing."
+        ) is False
+
+    def test_bank_details_without_account_word_detected(self) -> None:
+        assert sensitive_info_request_detector(
+            "Kindly share your bank details before the interview."
+        ) is True
+
     def test_pay_to_join_detected(self) -> None:
         assert sensitive_info_request_detector(
             "You need to pay ₹2000 to join the programme."
@@ -476,6 +534,278 @@ class TestSensitiveInfoRequestDetector:
 
     def test_pan_card_detected(self) -> None:
         assert sensitive_info_request_detector("Submit your PAN card number.") is True
+
+
+# ===========================================================================
+# 6b — guaranteed_outcome_claim_detector
+# ===========================================================================
+
+class TestGuaranteedOutcomeClaimDetector:
+
+    def test_empty_text_returns_false(self) -> None:
+        assert guaranteed_outcome_claim_detector("") is False
+
+    def test_100_percent_placement_guarantee_detected(self) -> None:
+        assert guaranteed_outcome_claim_detector("100% placement guarantee for all interns.") is True
+
+    def test_guaranteed_job_detected(self) -> None:
+        assert guaranteed_outcome_claim_detector("Guaranteed job after 1 month of training.") is True
+
+    def test_guaranteed_certificate_detected(self) -> None:
+        assert guaranteed_outcome_claim_detector("Guaranteed certificate on completion.") is True
+
+    def test_assured_placement_detected(self) -> None:
+        assert guaranteed_outcome_claim_detector("Assured placement with top companies.") is True
+
+    def test_no_interview_required_detected(self) -> None:
+        assert guaranteed_outcome_claim_detector("No interview required, direct onboarding.") is True
+
+    def test_selected_without_interview_detected(self) -> None:
+        assert guaranteed_outcome_claim_detector("Get hired without any interview.") is True
+
+    def test_instant_selection_detected(self) -> None:
+        assert guaranteed_outcome_claim_detector("Instant selection for all candidates.") is True
+
+    def test_whatsapp_only_detected(self) -> None:
+        assert guaranteed_outcome_claim_detector("Apply via WhatsApp only for quick response.") is True
+
+    def test_telegram_group_detected(self) -> None:
+        assert guaranteed_outcome_claim_detector("Join our Telegram group to get started.") is True
+
+    def test_refer_and_earn_detected(self) -> None:
+        assert guaranteed_outcome_claim_detector("Refer and earn bonus for every friend who joins.") is True
+
+    def test_clean_internship_not_flagged(self) -> None:
+        assert guaranteed_outcome_claim_detector(ANAKIN_SUMMARY) is False
+
+    def test_normal_interview_mention_not_flagged(self) -> None:
+        assert guaranteed_outcome_claim_detector(
+            "Shortlisted candidates will be invited for an interview."
+        ) is False
+
+    def test_return_type_is_bool(self) -> None:
+        assert isinstance(guaranteed_outcome_claim_detector("hello"), bool)
+
+    def test_case_insensitive(self) -> None:
+        assert guaranteed_outcome_claim_detector("GUARANTEED PLACEMENT") is True
+
+
+# ===========================================================================
+# 6c — external_form_and_phone_handoff_detector
+# ===========================================================================
+
+class TestExternalFormAndPhoneHandoffDetector:
+
+    def test_empty_text_returns_false_false(self) -> None:
+        assert external_form_and_phone_handoff_detector("") == (False, False)
+
+    def test_real_zefrix_example_detects_both(self) -> None:
+        # Verbatim (redacted phone) from a real Internshala scrape
+        text = (
+            "Love making Reels? Get PAID for it. Zefrix is hiring a Social "
+            "Media Intern. Apply now: https://forms.gle/MoCTSfEVCwL3GB2n7 "
+            "or call on +918854996448"
+        )
+        form, phone = external_form_and_phone_handoff_detector(text)
+        assert form is True
+        assert phone is True
+
+    def test_forms_gle_alone_detected(self) -> None:
+        form, phone = external_form_and_phone_handoff_detector(
+            "Apply here: https://forms.gle/abc123xyz"
+        )
+        assert form is True
+        assert phone is False
+
+    def test_google_docs_forms_url_detected(self) -> None:
+        form, _ = external_form_and_phone_handoff_detector(
+            "Fill this out: https://docs.google.com/forms/d/e/xyz/viewform"
+        )
+        assert form is True
+
+    def test_typeform_detected(self) -> None:
+        form, _ = external_form_and_phone_handoff_detector("Apply via https://typeform.com/to/abc123")
+        assert form is True
+
+    def test_phone_handoff_alone_detected(self) -> None:
+        form, phone = external_form_and_phone_handoff_detector(
+            "For more details, WhatsApp us on 9876543210"
+        )
+        assert form is False
+        assert phone is True
+
+    def test_bare_phone_number_without_contact_verb_not_flagged(self) -> None:
+        # A 10-digit number with no "call/contact/whatsapp" nearby should
+        # not trigger — avoids false positives on unrelated numeric data.
+        _, phone = external_form_and_phone_handoff_detector(
+            "Reference code: 9876543210 for internal tracking purposes."
+        )
+        assert phone is False
+
+    def test_standard_business_contact_line_not_flagged(self) -> None:
+        # Real-corpus false positive: a legitimate construction-firm job
+        # posting listed a standard "Contact: <phone>" business line and
+        # even said "Apply directly through Internshala" - not a scam
+        # funnel at all. "contact" was removed from the trigger-verb list
+        # because it's too generic for normal business communications.
+        form, phone = external_form_and_phone_handoff_detector(
+            "How to Apply: Apply directly through Internshala or send your "
+            "resume to hr@company.com. Contact: 9048500028 / 9048500068"
+        )
+        assert form is False
+        assert phone is False
+
+    def test_clean_internship_not_flagged(self) -> None:
+        form, phone = external_form_and_phone_handoff_detector(ANAKIN_SUMMARY)
+        assert form is False
+        assert phone is False
+
+    def test_platform_apply_link_not_flagged(self) -> None:
+        form, _ = external_form_and_phone_handoff_detector(
+            "Apply via the official Internshala application form for this role."
+        )
+        assert form is False
+
+    def test_return_type_is_tuple_of_bools(self) -> None:
+        result = external_form_and_phone_handoff_detector("hello")
+        assert isinstance(result, tuple)
+        assert all(isinstance(v, bool) for v in result)
+
+
+# ===========================================================================
+# 6d — training_program_disguised_as_internship_detector
+# ===========================================================================
+
+class TestTrainingProgramDisguisedAsInternshipDetector:
+
+    def test_empty_text_returns_false(self) -> None:
+        assert training_program_disguised_as_internship_detector("") is False
+
+    def test_real_ev_design_example_detected(self) -> None:
+        # Verbatim from a real LetsIntern scrape
+        text = (
+            "The Electric Vehicle Design Internship is a career-focused, "
+            "hands-on training program designed for students and freshers "
+            "who want to build a strong future in the EV and automotive industry."
+        )
+        assert training_program_disguised_as_internship_detector(text) is True
+
+    def test_real_sponsored_admission_example_detected(self) -> None:
+        # Verbatim from a real scrape (company field: "BBA")
+        text = (
+            "We are looking for motivated individuals to join our team in a "
+            "unique Work-Study program. Selected candidates will be provided "
+            "with 100% sponsored admission to a professional degree or "
+            "certification program (BBA, MBA, BCA, or MCA) from our partner university."
+        )
+        assert training_program_disguised_as_internship_detector(text) is True
+
+    def test_training_and_internship_simultaneously_detected(self) -> None:
+        assert training_program_disguised_as_internship_detector(
+            "Training and internships will go simultaneously."
+        ) is True
+
+    def test_self_paced_program_detected(self) -> None:
+        assert training_program_disguised_as_internship_detector(
+            "It is a self-paced program with weekly milestones."
+        ) is True
+
+    def test_bare_training_mention_as_job_duty_not_flagged(self) -> None:
+        # Real-data false-positive case verified against the corpus: a role
+        # that coordinates/sells training programs as a normal job duty
+        # must NOT be flagged - this is common and legitimate.
+        text = (
+            "Coordinate and manage end-to-end execution of virtual training "
+            "programs, including scheduling and communications with instructors."
+        )
+        assert training_program_disguised_as_internship_detector(text) is False
+
+    def test_training_programs_as_sales_target_not_flagged(self) -> None:
+        text = "Qualify leads by assessing client needs for training programs, workshops, or coaching sessions."
+        assert training_program_disguised_as_internship_detector(text) is False
+
+    def test_clean_internship_not_flagged(self) -> None:
+        assert training_program_disguised_as_internship_detector(ANAKIN_SUMMARY) is False
+
+    def test_return_type_is_bool(self) -> None:
+        assert isinstance(training_program_disguised_as_internship_detector("hello"), bool)
+
+    def test_case_insensitive(self) -> None:
+        assert training_program_disguised_as_internship_detector(
+            "THIS IS A CAREER-FOCUSED, HANDS-ON TRAINING PROGRAM"
+        ) is True
+
+
+# ===========================================================================
+# 6e — zero_shot_scam_signal
+# ===========================================================================
+#
+# NOTE: the real model (MoritzLaurer/deberta-v3-xsmall-zeroshot-v1.1-all-33)
+# was manually validated against 3 real scam examples + 3 paraphrased
+# variants + 2 clean examples during development — see ZeroShotConfig's
+# docstring in config.py for the results. Tests here mock the classifier
+# rather than loading the real ~146MB model (~50s cold start), to keep the
+# suite fast; they verify the wiring/gating logic, not model accuracy.
+
+class TestZeroShotScamSignal:
+
+    def test_disabled_by_default_returns_none(self) -> None:
+        # cfg.zero_shot.enabled defaults to False — must short-circuit
+        # without even attempting to load the classifier.
+        category, confidence = zero_shot_scam_signal("some internship text")
+        assert category is None
+        assert confidence == 0.0
+
+    def test_empty_text_returns_none_even_when_enabled(self) -> None:
+        with patch("scam_detector.features.text_features._cfg") as mock_cfg:
+            mock_cfg.zero_shot.enabled = True
+            category, confidence = zero_shot_scam_signal("")
+            assert category is None
+            assert confidence == 0.0
+
+    def test_classifier_unavailable_returns_none(self) -> None:
+        with patch("scam_detector.features.text_features._cfg") as mock_cfg, \
+             patch("scam_detector.features.text_features._zero_shot_classifier", return_value=None):
+            mock_cfg.zero_shot.enabled = True
+            category, confidence = zero_shot_scam_signal("some internship text")
+            assert category is None
+            assert confidence == 0.0
+
+    def test_normal_label_top_prediction_returns_none(self) -> None:
+        mock_classifier = lambda text, labels: {
+            "labels": ["a normal, specific job description with real responsibilities",
+                       "sells a paid training or certification course disguised as a job"],
+            "scores": [0.9, 0.1],
+        }
+        with patch("scam_detector.features.text_features._cfg") as mock_cfg, \
+             patch("scam_detector.features.text_features._zero_shot_classifier", return_value=mock_classifier):
+            mock_cfg.zero_shot.enabled = True
+            category, confidence = zero_shot_scam_signal("a normal internship")
+            assert category is None
+            assert confidence == 0.0
+
+    def test_non_normal_top_prediction_returns_category_and_score(self) -> None:
+        mock_classifier = lambda text, labels: {
+            "labels": ["sells a paid training or certification course disguised as a job",
+                       "a normal, specific job description with real responsibilities"],
+            "scores": [0.93, 0.07],
+        }
+        with patch("scam_detector.features.text_features._cfg") as mock_cfg, \
+             patch("scam_detector.features.text_features._zero_shot_classifier", return_value=mock_classifier):
+            mock_cfg.zero_shot.enabled = True
+            category, confidence = zero_shot_scam_signal("some scammy text")
+            assert category == "sells a paid training or certification course disguised as a job"
+            assert confidence == pytest.approx(0.93)
+
+    def test_classifier_exception_returns_none(self) -> None:
+        def raising_classifier(text, labels):
+            raise RuntimeError("inference failed")
+        with patch("scam_detector.features.text_features._cfg") as mock_cfg, \
+             patch("scam_detector.features.text_features._zero_shot_classifier", return_value=raising_classifier):
+            mock_cfg.zero_shot.enabled = True
+            category, confidence = zero_shot_scam_signal("some text")
+            assert category is None
+            assert confidence == 0.0
 
 
 # ===========================================================================

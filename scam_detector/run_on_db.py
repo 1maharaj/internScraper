@@ -41,12 +41,9 @@ PARENT_ENV = BASE_DIR.parent.parent / "ifind" / ".env.local"
 if PARENT_ENV.exists():
     load_dotenv(PARENT_ENV)
 
-MONGODB_URI = os.getenv("MONGODB_URI") or (
-    "mongodb://samwlhds:LwO4fqJfCkOld8Nz@ac-0igzdj2-shard-00-00.j8uearf.mongodb.net:27017,"
-    "ac-0igzdj2-shard-00-01.j8uearf.mongodb.net:27017,"
-    "ac-0igzdj2-shard-00-02.j8uearf.mongodb.net:27017/ifind?"
-    "ssl=true&replicaSet=atlas-hqgb18-shard-0&authSource=admin&appName=iFind"
-)
+MONGODB_URI = os.getenv("MONGODB_URI")
+if not MONGODB_URI:
+    raise SystemExit("MONGODB_URI not set (put it in .env.local)")
 DB_NAME = os.getenv("MONGODB_DB_NAME", "ifind")
 COLLECTION_NAME = os.getenv("MONGODB_COLLECTION", "internships.mod-unvectorised")
 OUTPUT_JSON = BASE_DIR / "scored_internships.json"

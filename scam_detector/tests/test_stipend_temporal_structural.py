@@ -509,10 +509,28 @@ class TestOpeningsZscore:
     def test_empty_peer_group_returns_none(self) -> None:
         assert openings_zscore(ANAKIN_RECORD, []) is None
 
-    def test_all_peers_same_value_returns_zero(self) -> None:
+    def test_all_peers_same_value_matching_record_returns_none(self) -> None:
+        # Zero variance among peers is uninformative when the record also
+        # matches it — cannot distinguish anomalous from normal, so this must
+        # report unknown (None), not a falsely confident 0.0.
         peers = [{**ANAKIN_RECORD, "openings": 2}, {**ROOTSKY_RECORD, "openings": 2}]
         record = {**EDITH_RECORD, "openings": 2}
-        assert openings_zscore(record, peers) == 0.0
+        assert openings_zscore(record, peers) is None
+
+    def test_all_peers_same_value_deviating_record_returns_signal(self) -> None:
+        # A record that deviates from an otherwise-constant peer group is a
+        # genuine, strong signal — infinitely far from every peer — and must
+        # not be discarded as unknown.
+        peers = [{**ANAKIN_RECORD, "openings": 1}, {**ROOTSKY_RECORD, "openings": 1}]
+        record = {**EDITH_RECORD, "openings": 50}
+        z = openings_zscore(record, peers)
+        assert z is not None and z > 2.0
+
+    def test_all_peers_same_value_deviating_record_below_returns_negative_signal(self) -> None:
+        peers = [{**ANAKIN_RECORD, "openings": 10}, {**ROOTSKY_RECORD, "openings": 10}]
+        record = {**EDITH_RECORD, "openings": 1}
+        z = openings_zscore(record, peers)
+        assert z is not None and z < -2.0
 
     def test_return_type_is_float(self) -> None:
         z = openings_zscore(ANAKIN_RECORD, OPENINGS_PEER_GROUP)

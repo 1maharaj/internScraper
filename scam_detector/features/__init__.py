@@ -24,6 +24,10 @@ from scam_detector.features.text_features import (
     title_summary_alignment,
     readability_and_grammar_signals,
     sensitive_info_request_detector,
+    guaranteed_outcome_claim_detector,
+    external_form_and_phone_handoff_detector,
+    training_program_disguised_as_internship_detector,
+    zero_shot_scam_signal,
     boilerplate_similarity,
 )
 from scam_detector.features.company_features import (
@@ -53,6 +57,14 @@ from scam_detector.features.duplicate_detection import (
     ClusterReport,
     cross_company_duplicate_flag,
 )
+from scam_detector.features.graph_features import (
+    build_company_infrastructure_graph,
+    shared_infrastructure_flag,
+    duplicate_cluster_network_size,
+    export_largest_components_visualization,
+    compute_graph_network_metrics,
+    company_network_risk_profile,
+)
 
 from pydantic import BaseModel, Field
 
@@ -80,6 +92,7 @@ def extract_all(
     unified :class:`FeatureVector`.
     """
     from typing import Any
+    from scam_detector.config import cfg
     from scam_detector.features.stipend_features import (
         normalize_stipend_to_hourly_inr,
         stipend_zscore,
@@ -107,36 +120,34 @@ def extract_all(
     hourly = normalize_stipend_to_hourly_inr(raw.get("stipend") or {}, raw.get("duration") or {})
     
     # Peer group logic for z-scores
-    def _as_str_set(value: Any) -> set[str]:
-        if not value:
-            return set()
-        if isinstance(value, str):
-            return {value.strip().lower()} if value.strip() else set()
-        if isinstance(value, list):
-            return {str(v).strip().lower() for v in value if v and str(v).strip()}
-        return set()
-
-    def _jaccard(a: set[str], b: set[str]) -> float:
-        if not a and not b:
-            return 0.0
-        union = a | b
-        if not union:
-            return 0.0
-        return len(a & b) / len(union)
+    from scam_detector.features.stipend_features import (
+        get_role_category,
+        get_city_tier,
+        get_company_size_tier,
+    )
 
     def _build_peer_group(rec: dict[str, Any], corpus: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        own_labels = _as_str_set(rec.get("field")) | _as_str_set(rec.get("tags"))
-        own_remote = bool(rec.get("isRemote"))
-        peers: list[dict[str, Any]] = []
-        for other in corpus:
-            if bool(other.get("isRemote")) != own_remote:
-                continue
-            other_labels = _as_str_set(other.get("field")) | _as_str_set(other.get("tags"))
-            if not own_labels or not other_labels:
-                peers.append(other)
-                continue
-            if _jaccard(own_labels, other_labels) >= 0.20:
-                peers.append(other)
+        target_role = get_role_category(rec)
+        target_city = get_city_tier(rec)
+        target_size = get_company_size_tier(rec)
+
+        peers = [
+            r for r in corpus
+            if get_role_category(r) == target_role
+            and get_city_tier(r) == target_city
+            and get_company_size_tier(r) == target_size
+        ]
+        if len(peers) < 2:
+            peers = [
+                r for r in corpus
+                if get_role_category(r) == target_role
+                and get_city_tier(r) == target_city
+            ]
+        if len(peers) < 2:
+            peers = [
+                r for r in corpus
+                if get_role_category(r) == target_role
+            ]
         return peers if peers else list(corpus)
 
     peer_group = _build_peer_group(raw, batch)
@@ -155,8 +166,8 @@ def extract_all(
         hourly_inr=hourly,
         perk_consistency_ok=not contradiction,
         stipend_type=stipend_type,
-        is_outlier_high=bool(peer_z is not None and peer_z > 3.0),
-        is_outlier_low=bool(peer_z is not None and peer_z < -2.0),
+        is_outlier_high=bool(peer_z is not None and peer_z > cfg.rule_thresholds.stipend_zscore_threshold),
+        is_outlier_low=bool(peer_z is not None and peer_z < -cfg.rule_thresholds.stipend_zscore_threshold),
         amount_plausibility_score=1.0 if hourly is not None else 0.5,
         missing_stipend_for_role=hourly is None,
     )
@@ -169,11 +180,17 @@ def extract_all(
     ] if company_key else [raw]
     
     burst = posting_burst_score(raw, company_recs)
+    from scam_detector.features.temporal_features import recruiter_posting_velocity
+    v24 = recruiter_posting_velocity(raw, batch, hours=24)
+    v72 = recruiter_posting_velocity(raw, batch, hours=72)
     temporal = TemporalFeatures(
         posting_burst_count=int(burst.get("burst_count") or 0),
         posting_burst_cadence=burst.get("cadence_days"),
         deadline_urgency_score=deadline_urgency_score(raw),
+        recruiter_posting_velocity_24h=v24,
+        recruiter_posting_velocity_72h=v72,
     )
+
 
     # Structural
     completeness = field_completeness_score(raw)
@@ -229,11 +246,21 @@ __all__: list[str] = [
     "DuplicateMatch",
     "ClusterReport",
     "cross_company_duplicate_flag",
+    "build_company_infrastructure_graph",
+    "shared_infrastructure_flag",
+    "duplicate_cluster_network_size",
+    "export_largest_components_visualization",
+    "compute_graph_network_metrics",
+    "company_network_risk_profile",
     "urgency_score",
     "caps_and_punctuation_ratio",
     "genericity_score",
     "title_summary_alignment",
     "readability_and_grammar_signals",
     "sensitive_info_request_detector",
+    "guaranteed_outcome_claim_detector",
+    "external_form_and_phone_handoff_detector",
+    "training_program_disguised_as_internship_detector",
+    "zero_shot_scam_signal",
     "boilerplate_similarity",
 ]

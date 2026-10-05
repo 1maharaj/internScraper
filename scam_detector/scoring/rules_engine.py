@@ -33,9 +33,8 @@ unverifiable_company         0.10  — scraper noise; reduces CONFIDENCE only
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -60,6 +59,13 @@ class RuleInput:
 
     # ── Text features (Prompt 2) ──────────────────────────────────────────
     sensitive_info_requested: bool = False
+    guaranteed_outcome_claim: bool = False
+    external_form_detected: bool = False
+    personal_contact_handoff_detected: bool = False
+    training_program_disguised_as_internship: bool = False
+    zero_shot_scam_category: str | None = None
+    zero_shot_scam_confidence: float = 0.0
+    scam_corpus_similarity: float = 0.0
     urgency_score: float = 0.0
     genericity_score: float = 0.0
     caps_ratio: float = 0.0
@@ -70,6 +76,7 @@ class RuleInput:
     # ── Company features (Prompt 3) ───────────────────────────────────────
     company_is_suspect: bool = False          # category-leak flag from remediation
     typosquat_min_distance: float = 1.0       # 0 = exact brand match
+    domain_age_days: int | None = None        # None = unknown/not applicable (platform/ATS link)
 
     # ── URL features (Prompt 3) ───────────────────────────────────────────
     is_platform_internal: bool = False
@@ -87,6 +94,26 @@ class RuleInput:
 
     # ── Duplicate detection (Prompt 5) ────────────────────────────────────
     cross_company_duplicate: bool = False
+
+    # ── Graph features (Phase 2/3) ────────────────────────────────────────
+    shared_infrastructure: bool = False
+
+    # ── NGO / fundraising-sector coordinated stipend network ──────────────
+    ngo_stipend_network: bool = False
+    ngo_stipend_network_company_count: int = 0
+
+    # ── Upfront payment & pay-to-work signals ─────────────────────────────
+    payment_required: bool = False
+    registration_fee: float = 0.0
+    fake_certificate_offer: bool = False
+
+    # ── Recruiter contact authenticity ────────────────────────────────────
+    recruiter_email_type: str = "Corporate"
+    suspicious_email_domain: bool = False
+
+    # ── Psychological pressure & manipulation signals ─────────────────────
+    emotional_manipulation_score: float = 0.0
+    phishing_language_score: float = 0.0
 
     # ── Remediation flags (Prompt 1) ──────────────────────────────────────
     remediation_flags: dict = field(default_factory=dict)
@@ -206,6 +233,298 @@ class HardDisqualifyingSignalsRule:
         )
 
 
+class GuaranteedOutcomeClaimRule:
+    """
+    Rule 1b: guaranteed_outcome_claim_detector == True
+
+    Fires when the posting claims a guaranteed job/placement/certificate
+    outcome, skips the interview entirely, or funnels applicants to a
+    WhatsApp/Telegram handoff — marketing hooks scammers front-load into the
+    title/summary/perks, which survive scraper truncation better than
+    payment-request language buried later in the text.
+
+    Weight: 0.85 (default) — near-hard disqualifying. Legitimate employers
+    cannot legally guarantee a hiring outcome or skip candidate screening.
+    """
+
+    rule_id = "guaranteed_outcome_claim"
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._cfg = config or _default_cfg
+
+    def evaluate(self, inp: RuleInput) -> RuleFinding:
+        w = self._cfg.rule_weights.guaranteed_outcome_claim
+        if inp.guaranteed_outcome_claim:
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Guaranteed-outcome / no-interview claim detected",
+                weight=w,
+                triggered=True,
+                explanation=(
+                    "Posting claims a guaranteed job/placement/certificate outcome, "
+                    "no-interview instant selection, or a WhatsApp/Telegram-only "
+                    "handoff — legitimate employers never guarantee hiring outcomes "
+                    "or skip screening entirely."
+                ),
+            )
+        return RuleFinding(
+            rule_id=self.rule_id,
+            description="Guaranteed-outcome / no-interview claim detected",
+            weight=w,
+            triggered=False,
+            explanation="No guaranteed-outcome or no-interview claims detected.",
+        )
+
+
+class ExternalFormHandoffRule:
+    """
+    Rule 1c: posting routes applicants to a generic third-party form
+    (Google Forms, Typeform, JotForm, etc.) and/or a personal phone number,
+    instead of the platform's own application flow.
+
+    Real-data basis: a "Zefrix" posting (company field corrupted to
+    "Content") read verbatim: "Apply now: https://forms.gle/... or call on
+    +918854996448" — informal WhatsApp-forward style. This is the classic
+    funnel for "internship" postings that are actually lead-generation for a
+    phone-sold paid training program: the applicant fills a generic form,
+    gets called, and the actual pitch (and money request) happens verbally,
+    off-platform — invisible to any text analysis of the original posting.
+    The form link + phone number is the only trace this leaves.
+
+    Weight: 0.60 when only one of (form link, phone handoff) is present;
+    escalates toward the hard-reject band when BOTH appear together, since
+    that combination has no ordinary legitimate explanation on an
+    aggregator platform that already provides its own apply flow.
+    """
+
+    rule_id = "external_form_handoff"
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._cfg = config or _default_cfg
+
+    def evaluate(self, inp: RuleInput) -> RuleFinding:
+        base_w = self._cfg.rule_weights.external_form_handoff
+        form = inp.external_form_detected
+        phone = inp.personal_contact_handoff_detected
+
+        if form and phone:
+            # Both together: escalate weight (capped at 1.0) — this specific
+            # combination is what the real Zefrix example showed.
+            w = min(1.0, base_w + 0.25)
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Off-platform form + personal phone handoff detected",
+                weight=w,
+                triggered=True,
+                explanation=(
+                    "Posting routes applicants to a generic third-party form AND a "
+                    "personal phone number instead of the platform's own apply flow — "
+                    "a classic funnel for phone-sold 'training program' scams disguised "
+                    "as internships, where the actual pitch happens verbally off-platform."
+                ),
+            )
+        if form or phone:
+            which = "a generic third-party form link" if form else "a personal phone-number handoff"
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Off-platform form + personal phone handoff detected",
+                weight=base_w,
+                triggered=True,
+                explanation=(
+                    f"Posting includes {which} instead of relying on the platform's own "
+                    f"apply flow — worth reviewing, though not conclusive on its own."
+                ),
+            )
+        return RuleFinding(
+            rule_id=self.rule_id,
+            description="Off-platform form + personal phone handoff detected",
+            weight=base_w,
+            triggered=False,
+            explanation="No external form link or personal phone handoff detected.",
+        )
+
+
+class TrainingProgramDisguisedAsInternshipRule:
+    """
+    Rule 1d: posting frames the internship itself as a packaged training or
+    paid-admission product rather than real work.
+
+    Real-data basis: a LetsIntern posting for "Electric Vehicle Design
+    Internship" (company field identical to its own title — no real
+    employer exists) describes itself as "a career-focused, hands-on
+    training program", with an incoherent skill list (AWS/DevOps/WordPress
+    for an EV design role) confirming templated course-marketing content.
+    A second example ("BBA" as company) offers "100% sponsored admission to
+    a professional degree or certification program" framed as an
+    internship — recruiting students into paid degree/certification
+    admissions.
+
+    Weight: 0.65 — moderate, not a hard reject. Legitimate accelerator- or
+    bootcamp-style internship programs that genuinely combine structured
+    training with real work exist too; this surfaces the pattern for human
+    review rather than presuming fraud outright.
+    """
+
+    rule_id = "training_program_disguised_as_internship"
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._cfg = config or _default_cfg
+
+    def evaluate(self, inp: RuleInput) -> RuleFinding:
+        w = self._cfg.rule_weights.training_program_disguised_as_internship
+        if inp.training_program_disguised_as_internship:
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Internship framed as a training/certification product",
+                weight=w,
+                triggered=True,
+                explanation=(
+                    "Posting frames the internship itself as a packaged training "
+                    "program or paid degree/certification admission rather than "
+                    "real work — a common funnel for phone-sold training fees "
+                    "disguised as an internship opportunity."
+                ),
+            )
+        return RuleFinding(
+            rule_id=self.rule_id,
+            description="Internship framed as a training/certification product",
+            weight=w,
+            triggered=False,
+            explanation="No training/certification-product framing detected.",
+        )
+
+
+class ZeroShotSemanticScamRule:
+    """
+    Rule 1e: pretrained zero-shot NLI classifier flags the posting as
+    matching a known scam-behavior category, above a confidence threshold.
+
+    ⚠️  Off by default and NOT currently recommended for use. A small
+    hand-picked validation looked promising, but a follow-up test against a
+    random 250-record real sample found a ~20% false-positive rate,
+    dominated by one label ("sells a paid training or certification course
+    disguised as a job") over-triggering on completely ordinary postings
+    from real companies. See ``ZeroShotConfig`` in config.py for the full
+    finding before ever setting ``cfg.zero_shot.enabled = True``.
+
+    Unlike every other text rule in this engine, this signal is NOT a
+    hand-written regex pattern — it's a pretrained model's semantic
+    judgment. When disabled, ``inp.zero_shot_scam_category`` is always None
+    and this rule never triggers (i.e. it is a safe no-op today).
+
+    Weight: 0.55 (default) — deliberately lower than the regex-based rules
+    in this tier, since a probabilistic model judgment is inherently less
+    certain than an exact pattern match on verified real examples.
+    """
+
+    rule_id = "zero_shot_semantic_scam_signal"
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._cfg = config or _default_cfg
+
+    def evaluate(self, inp: RuleInput) -> RuleFinding:
+        w = self._cfg.rule_weights.zero_shot_semantic_scam_signal
+        threshold = self._cfg.zero_shot.confidence_threshold
+        if inp.zero_shot_scam_category and inp.zero_shot_scam_confidence >= threshold:
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Pretrained model flagged a semantic scam-behavior pattern",
+                weight=w,
+                triggered=True,
+                explanation=(
+                    f"Zero-shot semantic classifier matched this posting to "
+                    f"'{inp.zero_shot_scam_category}' with "
+                    f"{inp.zero_shot_scam_confidence:.0%} confidence — a pretrained-model "
+                    f"signal, not a hand-written pattern match, useful for catching "
+                    f"scam phrasing that regex-based rules would miss."
+                ),
+            )
+        return RuleFinding(
+            rule_id=self.rule_id,
+            description="Pretrained model flagged a semantic scam-behavior pattern",
+            weight=w,
+            triggered=False,
+            explanation="No semantic scam-behavior pattern detected (or classifier disabled).",
+        )
+
+
+class SimilarToConfirmedScamRule:
+    """
+    Rule 1f: posting is semantically near-identical to a listing a human
+    moderator already confirmed as a scam (the feedback loop).
+
+    This is the mechanism that makes confirmed scams generalize beyond the
+    same company reposting under its own name (which ``company_reputation_
+    score`` already catches) to a DIFFERENT company using similar wording -
+    e.g. a template scam reused by a new shell company. SBERT cosine
+    similarity is computed against every confirmed_scam record in
+    FeedbackStore (see ``get_scam_corpus_embeddings`` /
+    ``scam_corpus_similarity`` in text_features.py) - this was previously
+    computed every run but silently discarded, feeding neither this rule
+    nor the anomaly model.
+
+    Weight: 0.70 (default) — high, since it's grounded in verified human
+    ground truth rather than a heuristic pattern, but deliberately kept
+    below the 0.75 hard-reject threshold: semantic similarity at this
+    threshold is strong but not infallible (two unrelated postings in a
+    narrow category, e.g. both generic "data entry" roles, could
+    legitimately score high without being the same scam).
+
+    Threshold calibration (0.85, measured with all-MiniLM-L6-v2): tested
+    whether a lower threshold would catch more reworded clones without
+    false-flagging unrelated postings — it would not. A near-identical scam
+    clone with one word changed scored 0.998; a heavily-reworded paraphrase
+    of the same underlying template scored only 0.61 (would evade almost
+    any reasonable threshold — an inherent limit of semantic similarity for
+    determined rewording, not a bug). Critically, an UNRELATED legitimate
+    posting (different company, same job category as a confirmed scam)
+    scored 0.71 similarity to that scam — higher than two unrelated
+    legitimate postings scored against each other (0.50). A threshold
+    anywhere near 0.71 would false-flag unrelated legitimate postings for
+    being topically similar. 0.85 sits safely above that false-positive
+    zone while still catching near-identical/lightly-reworded clones.
+
+    Empty/no feedback yet: ``scam_corpus_similarity`` defaults to 0.0 and
+    this rule never triggers until at least one confirmed_scam label
+    exists - it has no effect before the feedback loop has any data.
+    """
+
+    rule_id = "similar_to_confirmed_scam"
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._cfg = config or _default_cfg
+
+    def evaluate(self, inp: RuleInput) -> RuleFinding:
+        w = self._cfg.rule_weights.similar_to_confirmed_scam
+        threshold = self._cfg.rule_thresholds.scam_corpus_similarity_threshold
+        sim = inp.scam_corpus_similarity
+
+        if sim >= threshold:
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Near-identical to a human-confirmed scam posting",
+                weight=w,
+                triggered=True,
+                explanation=(
+                    f"This posting is semantically near-identical (similarity = "
+                    f"{sim:.2f}, threshold = {threshold:.2f}) to a listing a "
+                    f"moderator already confirmed was a scam — likely the same "
+                    f"template reused under a different company name."
+                ),
+            )
+
+        return RuleFinding(
+            rule_id=self.rule_id,
+            description="Near-identical to a human-confirmed scam posting",
+            weight=w,
+            triggered=False,
+            explanation=(
+                f"Not closely similar to any confirmed scam on record "
+                f"(similarity = {sim:.2f})."
+            ),
+        )
+
+
 class StipendPerkContradictionRule:
     """
     Rule 2: stipend_perk_consistency_check == True (inconsistency found)
@@ -288,6 +607,101 @@ class CrossCompanyDuplicateRule:
             weight=w,
             triggered=False,
             explanation="No cross-company near-duplicate detected.",
+        )
+
+
+class SharedInfrastructureRule:
+    """
+    Rule 3b: shared_infrastructure_flag == True
+
+    Fires when a company's applyLink domain is shared with 3+ OTHER distinctly-named
+    companies in the corpus. This indicates shared, coordinate posting infrastructure,
+    which is a strong signal for automated shell-posting networks.
+
+    Weight: 0.65 (default, configurable)
+    """
+
+    rule_id = "shared_infrastructure"
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._cfg = config or _default_cfg
+
+    def evaluate(self, inp: RuleInput) -> RuleFinding:
+        w = self._cfg.rule_weights.shared_infrastructure
+        if inp.shared_infrastructure:
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Shared off-platform infrastructure across multiple companies detected",
+                weight=w,
+                triggered=True,
+                explanation=(
+                    "This company's applyLink domain is shared with 3+ other distinctly-named "
+                    "companies — a strong signature of coordinated shell-company posting networks."
+                ),
+            )
+        return RuleFinding(
+            rule_id=self.rule_id,
+            description="Shared off-platform infrastructure across multiple companies detected",
+            weight=w,
+            triggered=False,
+            explanation="No shared off-platform infrastructure detected.",
+        )
+
+
+class NgoFundraisingStipendNetworkRule:
+    """
+    Rule 3c: NGO/fundraising-sector posting whose exact lump-sum stipend
+    amount is shared by 3+ distinct companies in the corpus.
+
+    Empirical basis: on real scraped data, several "Foundation"-named
+    entities post under different role titles (Business Consultant, Program
+    Assistant, Fundraising, Crowdfunding) but share an identical lump-sum
+    stipend (e.g. ₹15,000) — a templated-payout signature that SBERT-based
+    text-duplicate detection does not catch, since each posting's wording
+    is independently written.
+
+    Deliberately scoped to lump-sum stipends only (not monthly, which
+    legitimately clusters around common round numbers across unrelated
+    real companies) and to NGO/fundraising-sector postings only — a
+    coincidental stipend match at an ordinary tech company is not this
+    signal.
+
+    Weight: 0.65 (default) — moderate, NOT a hard reject. Legitimate
+    fundraising-platform aggregators that standardize pay across multiple
+    NGO partners are a real business model too (same ambiguity already
+    documented for cross_company_duplicate's NayePankh/Basti Ki Pathshala
+    case) — this surfaces the pattern for human review, it does not
+    presume fraud.
+    """
+
+    rule_id = "ngo_fundraising_stipend_network"
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._cfg = config or _default_cfg
+
+    def evaluate(self, inp: RuleInput) -> RuleFinding:
+        w = self._cfg.rule_weights.ngo_fundraising_stipend_network
+        if inp.ngo_stipend_network:
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="NGO/fundraising-sector coordinated stipend network detected",
+                weight=w,
+                triggered=True,
+                explanation=(
+                    f"This NGO/fundraising-sector posting shares its exact lump-sum "
+                    f"stipend amount with {inp.ngo_stipend_network_company_count} other "
+                    f"distinctly-named companies — a templated-payout pattern consistent "
+                    f"with a coordinated shell-NGO network, though also seen with "
+                    f"legitimate fundraising-platform aggregators. Recommend human review "
+                    f"of the company's registration/legitimacy."
+                ),
+            )
+        return RuleFinding(
+            rule_id=self.rule_id,
+            description="NGO/fundraising-sector coordinated stipend network detected",
+            weight=w,
+            triggered=False,
+            explanation="No coordinated NGO stipend network pattern detected.",
         )
 
 
@@ -462,6 +876,72 @@ class TyposquatDomainRule:
         )
 
 
+class YoungDomainAgeRule:
+    """
+    Rule 6b: off-platform employer domain was registered very recently.
+
+    A classic, well-established fraud signal: scam operations typically
+    register a domain shortly before (or even after) starting to post
+    fraudulent listings, while legitimate companies' domains are usually
+    years old. ``inp.domain_age_days`` is only ever populated for a genuine
+    off-platform employer domain — the WHOIS lookup is skipped entirely for
+    platform/ATS links (see ``extract_company_url_features`` in
+    company_features.py), since those are always old and identical across
+    nearly every record on that platform, carrying zero discriminative
+    value. ``None`` means unknown/not-applicable and never triggers.
+
+    Weight: 0.55 (default) — moderate. A young domain alone is not
+    definitive (genuine new startups have young domains too); this is a
+    supporting signal, not a hard reject.
+
+    NOTE: as of this writing, this rule is structurally unreachable on the
+    current real corpus — every record's apply link routes through a
+    platform or known ATS (confirmed empirically across 2,000+ real
+    records), so ``domain_age_days`` is always None. It is correct, tested,
+    and ready for the moment genuine off-platform employer links appear in
+    the data (e.g. broader scraper coverage, or direct employer postings).
+    """
+
+    rule_id = "young_domain_age"
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._cfg = config or _default_cfg
+
+    def evaluate(self, inp: RuleInput) -> RuleFinding:
+        w = self._cfg.rule_weights.young_domain_age
+        threshold_days = self._cfg.rule_thresholds.young_domain_age_days_threshold
+
+        if inp.domain_age_days is None:
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Off-platform employer domain registered very recently",
+                weight=w,
+                triggered=False,
+                explanation="Domain age unknown or not applicable (platform/ATS link).",
+            )
+
+        if inp.domain_age_days < threshold_days:
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Off-platform employer domain registered very recently",
+                weight=w,
+                triggered=True,
+                explanation=(
+                    f"Off-platform employer domain was registered only "
+                    f"{inp.domain_age_days} days ago (threshold = {threshold_days}) — "
+                    "a classic fraud signal, though not definitive on its own."
+                ),
+            )
+
+        return RuleFinding(
+            rule_id=self.rule_id,
+            description="Off-platform employer domain registered very recently",
+            weight=w,
+            triggered=False,
+            explanation=f"Domain age ({inp.domain_age_days} days) is not suspiciously young.",
+        )
+
+
 class MassOpeningsVagueRoleRule:
     """
     Rule 7: openings_zscore HIGH AND genericity_score HIGH (combined condition)
@@ -539,6 +1019,152 @@ class MassOpeningsVagueRoleRule:
         )
 
 
+class UpfrontFeeAndPayToWorkRule:
+    """
+    Rule 9: Upfront payment, registration fee, or pay-to-work pattern.
+
+    Fires when any of:
+      - payment_required is True
+      - registration_fee > 0
+      - fake_certificate_offer is True (guaranteed certificate upon payment)
+
+    Weight: 0.90 — near hard-reject; genuine internships never charge candidates
+    for registration, application, security deposits, or certificates.
+    """
+
+    rule_id = "upfront_fee_and_pay_to_work"
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._cfg = config or _default_cfg
+
+    def evaluate(self, inp: RuleInput) -> RuleFinding:
+        w = self._cfg.rule_weights.upfront_fee_and_pay_to_work
+        reasons: list[str] = []
+        if inp.payment_required:
+            reasons.append("upfront payment explicitly required")
+        if inp.registration_fee > 0:
+            reasons.append(f"registration fee of INR {inp.registration_fee:.2f} demanded")
+        if inp.fake_certificate_offer:
+            reasons.append("pay-to-receive certificate / certificate sales pattern")
+
+        if reasons:
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Upfront fee or pay-to-work requirement",
+                weight=w,
+                triggered=True,
+                explanation=(
+                    "Pay-to-work pattern detected: " + "; ".join(reasons) +
+                    ". Legitimate employers do not charge internship candidates fees or deposits."
+                ),
+            )
+        return RuleFinding(
+            rule_id=self.rule_id,
+            description="Upfront fee or pay-to-work requirement",
+            weight=w,
+            triggered=False,
+            explanation="No upfront fees or pay-to-work demands detected.",
+        )
+
+
+class SuspiciousRecruiterContactRule:
+    """
+    Rule 10: Suspicious recruiter contact channel / disposable email.
+
+    Fires when recruiter uses a free webmail service (e.g. Gmail, Yahoo)
+    or an explicitly flagged suspicious email domain.
+
+    Weight: 0.50 — moderate signal. Legitimate corporate recruiters use verified
+    company domains; free email addresses are frequently used in scam operations.
+    """
+
+    rule_id = "suspicious_recruiter_contact"
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._cfg = config or _default_cfg
+
+    def evaluate(self, inp: RuleInput) -> RuleFinding:
+        w = self._cfg.rule_weights.suspicious_recruiter_contact
+        reasons: list[str] = []
+        if inp.suspicious_email_domain:
+            reasons.append("recruiter email domain flagged as suspicious/unverified")
+        if str(inp.recruiter_email_type).strip().lower() in ("free", "disposable"):
+            reasons.append(f"recruiter uses {inp.recruiter_email_type.lower()} webmail instead of corporate domain")
+
+        if reasons:
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Suspicious recruiter contact channel",
+                weight=w,
+                triggered=True,
+                explanation=(
+                    "Recruiter contact risk: " + "; ".join(reasons) +
+                    ". Corporate listings should be sourced from verified enterprise domains."
+                ),
+            )
+        return RuleFinding(
+            rule_id=self.rule_id,
+            description="Suspicious recruiter contact channel",
+            weight=w,
+            triggered=False,
+            explanation="Recruiter contact channel appears legitimate or corporate-affiliated.",
+        )
+
+
+class UrgencyAndPsychologicalPressureRule:
+    """
+    Rule 11: Artificial urgency & psychological pressure.
+
+    Fires when high urgency score, emotional manipulation score, or phishing language
+    score exceeds configured thresholds.
+
+    Weight: 0.45 — moderate signal; scams frequently use artificial countdowns,
+    pressure tactics ('apply in 2 hours', 'only 1 slot left') to rush applicants.
+    """
+
+    rule_id = "urgency_psychological_pressure"
+
+    def __init__(self, config: Config | None = None) -> None:
+        self._cfg = config or _default_cfg
+
+    def evaluate(self, inp: RuleInput) -> RuleFinding:
+        w = self._cfg.rule_weights.urgency_psychological_pressure
+        urg_thresh = self._cfg.rule_thresholds.urgency_score_threshold
+        emo_thresh = self._cfg.rule_thresholds.emotional_manipulation_threshold
+
+        reasons: list[str] = []
+        # Normalized urgency score (if scaled 0-100, normalize to [0, 1])
+        urg = inp.urgency_score / 100.0 if inp.urgency_score > 1.0 else inp.urgency_score
+        emo = inp.emotional_manipulation_score / 100.0 if inp.emotional_manipulation_score > 1.0 else inp.emotional_manipulation_score
+        phish = inp.phishing_language_score / 100.0 if inp.phishing_language_score > 1.0 else inp.phishing_language_score
+
+        if urg > urg_thresh:
+            reasons.append(f"high artificial urgency score ({urg:.2f} > {urg_thresh:.2f})")
+        if emo > emo_thresh:
+            reasons.append(f"emotional manipulation score ({emo:.2f} > {emo_thresh:.2f})")
+        if phish > 0.50:
+            reasons.append(f"phishing language indicators ({phish:.2f} > 0.50)")
+
+        if reasons:
+            return RuleFinding(
+                rule_id=self.rule_id,
+                description="Artificial urgency and psychological manipulation",
+                weight=w,
+                triggered=True,
+                explanation=(
+                    "Psychological pressure tactics detected: " + "; ".join(reasons) +
+                    ". Scammers use fabricated urgency to prevent thorough vetting."
+                ),
+            )
+        return RuleFinding(
+            rule_id=self.rule_id,
+            description="Artificial urgency and psychological manipulation",
+            weight=w,
+            triggered=False,
+            explanation="Urgency and emotional indicators within normal bounds.",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Default rule registry
 # ---------------------------------------------------------------------------
@@ -547,11 +1173,22 @@ def _default_rules(config: Config | None = None) -> list[Rule]:
     cfg = config or _default_cfg
     return [
         HardDisqualifyingSignalsRule(cfg),
+        GuaranteedOutcomeClaimRule(cfg),
+        ExternalFormHandoffRule(cfg),
+        TrainingProgramDisguisedAsInternshipRule(cfg),
+        ZeroShotSemanticScamRule(cfg),
+        SimilarToConfirmedScamRule(cfg),
+        UpfrontFeeAndPayToWorkRule(cfg),
         StipendPerkContradictionRule(cfg),
         CrossCompanyDuplicateRule(cfg),
+        SharedInfrastructureRule(cfg),
+        NgoFundraisingStipendNetworkRule(cfg),
+        SuspiciousRecruiterContactRule(cfg),
+        UrgencyAndPsychologicalPressureRule(cfg),
         ExtremeStipendOutlierRule(cfg),
         UnverifiableCompanyRule(cfg),
         TyposquatDomainRule(cfg),
+        YoungDomainAgeRule(cfg),
         MassOpeningsVagueRoleRule(cfg),
     ]
 
@@ -644,7 +1281,7 @@ def apply_rules(features: object) -> RulesResult:
     else:
         # Duck-type bridge: pull fields from a FeatureVector-like object
         # so the legacy ``apply_rules(feature_vector)`` call pattern still works.
-        def _get(obj: object, *attrs: str, default: object = None) -> object:
+        def _get(obj: object, *attrs: str, default: Any = None) -> Any:
             for attr in attrs:
                 try:
                     val = getattr(obj, attr)
@@ -665,6 +1302,9 @@ def apply_rules(features: object) -> RulesResult:
             ),
             cross_company_duplicate=bool(
                 _get(features, "cross_company_duplicate", default=False)
+            ),
+            shared_infrastructure=bool(
+                _get(features, "shared_infrastructure", default=False)
             ),
             stipend_peer_zscore=None,
             company_is_suspect=bool(

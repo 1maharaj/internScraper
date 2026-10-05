@@ -299,6 +299,35 @@ class TestFlagMislabeledCompany:
         _, flags = flag_mislabeled_company(record)
         assert "company_suspect" not in flags
 
+    def test_company_identical_to_title_detected(self) -> None:
+        # Real-data example: LetsIntern "Electric Vehicle Design Internship"
+        record = {
+            "company": "Electric Vehicle Design Internship",
+            "name": "Electric Vehicle Design Internship 2026",
+        }
+        _, flags = flag_mislabeled_company(record)
+        assert flags.get("company_suspect") is True
+        assert flags.get("company_match_via") == "title_match"
+
+    def test_company_identical_to_title_exact_no_year(self) -> None:
+        record = {"company": "Content Writing Internship", "name": "Content Writing Internship"}
+        _, flags = flag_mislabeled_company(record)
+        assert flags.get("company_suspect") is True
+        assert flags.get("company_match_via") == "title_match"
+
+    def test_real_company_substring_of_title_not_flagged(self) -> None:
+        # A real company name legitimately appearing as part of the title
+        # (e.g. "TCS" in "TCS Digital Internship") must NOT be flagged -
+        # only an exact company==title match should trigger this check.
+        record = {"company": "TCS", "name": "TCS Digital Internship 2026"}
+        _, flags = flag_mislabeled_company(record)
+        assert "company_suspect" not in flags
+
+    def test_unrelated_company_and_title_not_flagged(self) -> None:
+        record = {"company": "Razorpay", "name": "Backend Engineering Internship"}
+        _, flags = flag_mislabeled_company(record)
+        assert "company_suspect" not in flags
+
     def test_social_media_marketing_detected(self) -> None:
         record = {**FIXTURE_NULL_DEADLINE, "company": "Social Media Marketing"}
         _, flags = flag_mislabeled_company(record)

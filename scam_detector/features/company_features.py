@@ -24,9 +24,13 @@ from __future__ import annotations
 
 import math
 import re
+import sqlite3
+import time
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any
+
 
 from pydantic import BaseModel, Field
 
@@ -63,6 +67,11 @@ class CompanyFeatures(BaseModel):
         le=1.0,
         description="Normalised edit distance to nearest known brand (0 = exact match)",
     )
+    domain_age_days: int | None = Field(
+        default=None,
+        description="Age of domain in days from WHOIS creation date (None if lookup fails or missing)",
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +377,97 @@ def typosquat_brand_distance(
 
 
 # ---------------------------------------------------------------------------
+# Function 5 — fetch_domain_age_days
+# ---------------------------------------------------------------------------
+
+_WHOIS_CACHE_DB_PATH = Path(__file__).parent / "whois_cache.sqlite"
+
+
+def fetch_domain_age_days(
+    domain: str,
+    cache_db_path: str | Path | None = None,
+    ttl_days: int = 30,
+) -> int | None:
+    """
+    Fetch WHOIS domain creation date and compute domain age in days.
+    Uses an SQLite local cache with TTL (default 30 days).
+
+    Lookup failures (socket error, domain missing, no python-whois installed)
+    are treated as missing data (returns None, NOT 0).
+    """
+    if not domain or not domain.strip():
+        return None
+
+    clean_domain = domain.strip().lower()
+    clean_domain = re.sub(r"^https?://", "", clean_domain).split("/")[0].split(":")[0]
+    if not clean_domain:
+        return None
+
+    db_path = Path(cache_db_path) if cache_db_path else _WHOIS_CACHE_DB_PATH
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    now = time.time()
+    ttl_seconds = ttl_days * 86400
+
+    # Query SQLite Cache
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS whois_cache (
+                domain TEXT PRIMARY KEY,
+                age_days INTEGER,
+                fetched_at REAL
+            )
+            """
+        )
+        cursor = conn.execute(
+            "SELECT age_days, fetched_at FROM whois_cache WHERE domain = ?",
+            (clean_domain,),
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            cached_age, fetched_at = row
+            conn.close()
+            if now - fetched_at < ttl_seconds:
+                return cached_age
+    except Exception:
+        conn = None
+
+    # Perform WHOIS Lookup
+    age_days: int | None = None
+    try:
+        import whois  # type: ignore
+        w = whois.whois(clean_domain)
+        creation_date = w.creation_date
+        if isinstance(creation_date, list):
+            creation_date = creation_date[0]
+        if isinstance(creation_date, (datetime, date)):
+            c_date = creation_date.date() if isinstance(creation_date, datetime) else creation_date
+            today = datetime.now(timezone.utc).date()
+            if c_date <= today:
+                age_days = (today - c_date).days
+    except Exception:
+        age_days = None  # Lookup failure treated as missing data
+
+    # Store Result in Cache
+    try:
+        if conn is None:
+            conn = sqlite3.connect(str(db_path))
+        with conn:
+            conn.execute(
+                "REPLACE INTO whois_cache (domain, age_days, fetched_at) VALUES (?, ?, ?)",
+                (clean_domain, age_days, now),
+            )
+        conn.close()
+    except Exception:
+        pass
+
+    return age_days
+
+
+
+# ---------------------------------------------------------------------------
 # Combined output model & top-level extractor
 # ---------------------------------------------------------------------------
 # Import here (bottom of file) to avoid circular imports between sibling
@@ -423,6 +523,13 @@ def extract_company_url_features(
     company: str = record.get("company") or ""
     apply_link: str = record.get("applyLink") or record.get("apply_link") or ""
 
+    # ── URL features ──────────────────────────────────────────────────────
+    components = parse_url_components(apply_link)
+    tld = components["tld"]
+    registered_dom = components["registered_domain"] or components["domain"]
+    is_internal = is_platform_internal_link(apply_link)
+    is_ats = is_known_ats_domain(apply_link)
+
     # ── Company features ──────────────────────────────────────────────────
     suspect = is_company_suspect(effective_flags)
 
@@ -432,6 +539,20 @@ def extract_company_url_features(
     else:
         freq = company_posting_frequency(company, batch)
         typo_dist = typosquat_brand_distance(company)
+        # Skip the WHOIS lookup entirely for platform-internal / known-ATS
+        # links: their domain age is always old and identical across nearly
+        # every record on that platform (internshala.com, naukri.com, ...),
+        # so it carries zero discriminative value even if looked up — this
+        # was previously an unconditional network call (SQLite-cached, but
+        # still wasted) on ~every record for a feature that was then never
+        # read by any rule or the anomaly model at all. Only look it up for
+        # the case where it's actually actionable: a genuine off-platform
+        # employer domain.
+        domain_age = (
+            fetch_domain_age_days(registered_dom)
+            if (registered_dom and not is_internal and not is_ats)
+            else None
+        )
         company_feats = CompanyFeatures(
             is_suspect=False,
             has_legal_suffix=has_legal_suffix(company),
@@ -439,11 +560,8 @@ def extract_company_url_features(
             posting_date_span_days=freq["date_span_days"],
             role_diversity_score=freq["role_diversity_score"],
             typosquat_min_distance=typo_dist,
+            domain_age_days=domain_age,
         )
-
-    # ── URL features ──────────────────────────────────────────────────────
-    components = parse_url_components(apply_link)
-    tld = components["tld"]
 
     url_feats = UrlFeatures(
         domain=components["domain"],
@@ -453,12 +571,129 @@ def extract_company_url_features(
         path_depth=components["path_depth"],
         query_param_count=components["query_param_count"],
         is_https=components["is_https"],
-        is_platform_internal=is_platform_internal_link(apply_link),
+        is_platform_internal=is_internal,
         is_url_shortener=is_url_shortener(apply_link),
-        is_known_ats=is_known_ats_domain(apply_link),
+        is_known_ats=is_ats,
         domain_entropy=url_entropy(apply_link),
         domain_company_similarity=domain_company_name_similarity(apply_link, company),
         tld_risk_score=_tld_risk_score(tld),
     )
 
     return CompanyUrlFeatureVector(company=company_feats, url=url_feats)
+
+
+
+# ---------------------------------------------------------------------------
+# NGO / fundraising-sector coordinated stipend network detection
+# ---------------------------------------------------------------------------
+#
+# Empirical finding (real Internshala + Unstop data): 7 distinct company
+# names — several plausible-sounding "Foundation" entities among them — post
+# under DIFFERENT role titles (Business Consultant, Program Assistant,
+# Fundraising, Crowdfunding, Social Entrepreneurship) but share the *exact
+# same* lump-sum stipend amount (₹15,000). SBERT-based duplicate detection
+# (0.92 cosine threshold) does NOT catch this — the posting text is
+# independently written per "company", only the underlying stipend template
+# is identical. This is a distinct, complementary signal: same operator (or
+# same aggregator platform) running multiple NGO-sounding fronts with a
+# templated pay structure, rather than a copy-pasted script.
+#
+# Deliberately scoped to lump_sum paid stipends only (not monthly), since
+# monthly stipends legitimately cluster around common round numbers
+# (₹5,000/₹10,000 per month) across totally unrelated real companies —
+# lump-sum is a rarer, more specific structure where exact-amount collisions
+# across "different" companies are far less likely to be coincidental.
+#
+# Per the same philosophy already documented in duplicate_detection.py's
+# NayePankh/Basti Ki Pathshala note: this is a known ambiguity (legitimate
+# fundraising-platform aggregators standardizing pay across NGO partners are
+# a real, non-fraudulent business model too) — surface it for human review,
+# do not treat it as an automatic hard reject.
+
+_NGO_SECTOR_KEYWORDS: list[str] = [
+    "ngo", "foundation", "trust", "society", "nonprofit", "non-profit",
+    "non profit", "charity", "welfare", "fundraising", "fundraiser",
+    "crowdfunding", "social work", "social entrepreneurship", "csr",
+    "philanthropy", "ngo internship",
+]
+
+
+def is_ngo_or_fundraising_sector(record: dict[str, Any]) -> bool:
+    """
+    Return True when the posting's company name, title, or tags indicate an
+    NGO / fundraising / social-sector internship.
+
+    Deliberately broad substring matching — this is a SECTOR classifier, not
+    a fraud signal on its own. It only matters combined with
+    ``ngo_stipend_network_flag``.
+    """
+    company = str(record.get("company") or "").lower()
+    title = str(record.get("name") or record.get("title") or "").lower()
+    tags = record.get("tags") or []
+    tags_text = " ".join(str(t) for t in tags).lower() if isinstance(tags, list) else str(tags).lower()
+
+    haystack = f"{company} {title} {tags_text}"
+    return any(kw in haystack for kw in _NGO_SECTOR_KEYWORDS)
+
+
+def build_lump_sum_stipend_index(
+    remediated_records: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> dict[tuple[float, str], set[str]]:
+    """
+    Corpus-level index: (amount, currency) -> set of distinct company keys
+    posting a "paid" / "lump_sum" stipend at exactly that amount.
+
+    Parameters
+    ----------
+    remediated_records:
+        List of (record, flags) tuples — flags used to exclude companies
+        already known to be scraper noise (``company_suspect``) from the
+        distinct-company count, so category-leak artifacts (e.g. a company
+        field literally reading "Social Work") don't inflate the signal.
+    """
+    index: dict[tuple[float, str], set[str]] = defaultdict(set)
+    for rec, flags in remediated_records:
+        if flags.get("company_suspect"):
+            continue
+        stipend = rec.get("stipend") or {}
+        if not isinstance(stipend, dict):
+            continue
+        if stipend.get("type") != "paid" or stipend.get("period") != "lump_sum":
+            continue
+        amount = stipend.get("amount")
+        if not amount or not isinstance(amount, (int, float)) or amount <= 0:
+            continue
+        currency = str(stipend.get("currency") or "INR")
+        company_key = (rec.get("company") or "").strip().lower()
+        if not company_key:
+            continue
+        index[(float(amount), currency)].add(company_key)
+    return index
+
+
+def ngo_stipend_network_flag(
+    record: dict[str, Any],
+    stipend_index: dict[tuple[float, str], set[str]],
+    *,
+    min_distinct_companies: int = 3,
+) -> tuple[bool, int]:
+    """
+    Return (flagged, distinct_company_count) for this record's stipend
+    template network.
+
+    Flagged when at least ``min_distinct_companies`` distinct (non-suspect)
+    companies in the corpus share this record's exact lump-sum stipend
+    amount — a coordinated-payout-template signal, independent of text
+    similarity.
+    """
+    stipend = record.get("stipend") or {}
+    if not isinstance(stipend, dict) or stipend.get("type") != "paid" or stipend.get("period") != "lump_sum":
+        return False, 0
+    amount = stipend.get("amount")
+    if not amount or not isinstance(amount, (int, float)) or amount <= 0:
+        return False, 0
+    currency = str(stipend.get("currency") or "INR")
+
+    companies = stipend_index.get((float(amount), currency), set())
+    count = len(companies)
+    return count >= min_distinct_companies, count

@@ -16,7 +16,13 @@ Sub-packages
   scam_detector.scoring       — Rules engine, risk engine, explainability
 """
 
-from scam_detector.pipeline import ScamDetectorPipeline, run_pipeline, process_records
+from scam_detector.pipeline import (
+    ScamDetectorPipeline,
+    run_pipeline,
+    process_records,
+    score_batch,
+    score_record,
+)
 from scam_detector.scoring.explain import ScamScoreResult
 from scam_detector.features import FeatureVector
 from scam_detector.feedback import (
@@ -31,6 +37,8 @@ __all__: list[str] = [
     "FeatureVector",
     "run_pipeline",
     "process_records",
+    "score_batch",
+    "score_record",
     "ReviewFeedback",
     "FeedbackStore",
     "build_training_labels",

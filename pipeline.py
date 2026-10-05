@@ -408,14 +408,24 @@ def push_to_pipeline(
         from scam_detector.pipeline import process_records
         scored_candidates = process_records(valid_candidates)
     except Exception as exc:
-        log.warning("Scam detector processing failed (%s) — falling back to standard scoring", exc)
-        scored_candidates = valid_candidates
+        # Fail closed: an unscored posting must never be auto-approved.
+        log.warning("Scam detector processing failed (%s) — routing all to manual review", exc)
+        scored_candidates = [
+            {
+                **c,
+                "scam_score": 50.0,
+                "decision": "review",
+                "confidence": 0.0,
+                "explanation_summary": "Scam detector unavailable; manual review required.",
+            }
+            for c in valid_candidates
+        ]
 
     # ── Final Moderation assembly & insertion into MongoDB ──────────────────
     for doc in scored_candidates:
         try:
             scam_score = float(doc.get("scam_score", 0.0))
-            decision = doc.get("decision", "clear")  # "clear" | "review" | "block"
+            decision = doc.get("decision", "review")  # "clear" | "review" | "block"
             confidence = float(doc.get("confidence", 1.0))
             summary_exp = str(doc.get("explanation_summary", ""))
 
@@ -425,20 +435,15 @@ def push_to_pipeline(
 
             scam_details: ScamDetailsDict = {
                 "score":              scam_score,
-                "decision":           decision if decision in ("clear", "review", "block") else "clear",
+                "decision":           decision if decision in ("clear", "review", "block") else "review",
                 "confidence":         confidence,
                 "explanationSummary": summary_exp,
                 "scamFlags":          raw_flags,
                 "evaluatedAt":        datetime.now(timezone.utc).isoformat(),
-                "riskBreakdown":      None,
+                "riskBreakdown":      {"anomalyScore": (doc.get("risk_breakdown") or {}).get("anomaly_score")},
             }
 
-            if decision == "clear":
-                mod_status = "auto_approved"
-            elif decision == "block":
-                mod_status = "auto_rejected"
-            else:
-                mod_status = "pending_review"
+            mod_status = {"clear": "auto_approved", "block": "auto_rejected"}.get(decision, "pending_review")
 
             doc["moderation"] = {
                 "status":          mod_status,

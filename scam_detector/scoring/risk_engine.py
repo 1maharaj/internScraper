@@ -21,6 +21,11 @@ from scam_detector.scoring.rules_engine import RuleFinding, RulesResult
 
 _HARD_DISQUALIFYING_RULE_ID = "hard_disqualifying_signals"
 
+# Cap on how many (feature, contribution) pairs surface in reviewer-facing
+# reports / API responses — the anomaly model's explain() returns the full
+# ~49-feature vector, which is not "top" anything without this cap.
+_TOP_CONTRIBUTING_FEATURES_LIMIT = 8
+
 
 # ---------------------------------------------------------------------------
 # Legacy supervised-ML stub (optional; not the Phase 5 blend path)
@@ -84,7 +89,50 @@ def _get_nested(obj: Any, *path: str, default: Any = None) -> Any:
     return cur if cur is not None else default
 
 
-def compute_confidence_score(record: Any, features: Any | None = None) -> float:
+_BASELINES_CACHE: dict | None = None
+
+
+def _get_source(record: Any) -> str | None:
+    if record is None:
+        return None
+    if isinstance(record, Mapping):
+        rec_dict = record.get("record")
+        if isinstance(rec_dict, Mapping):
+            return rec_dict.get("source")
+        return record.get("source")
+    if hasattr(record, "record"):
+        rec_val = getattr(record, "record")
+        if isinstance(rec_val, Mapping):
+            return rec_val.get("source")
+        return getattr(rec_val, "source", None)
+    return getattr(record, "source", None)
+
+
+def load_source_baselines(path: str) -> dict:
+    global _BASELINES_CACHE
+    if _BASELINES_CACHE is not None:
+        return _BASELINES_CACHE
+    import json
+    from pathlib import Path
+    p = Path(path)
+    if p.exists():
+        try:
+            with p.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                _BASELINES_CACHE = data if isinstance(data, dict) else {}
+                return _BASELINES_CACHE
+        except Exception:
+            pass
+    _BASELINES_CACHE = {}
+    return _BASELINES_CACHE
+
+
+def clear_baselines_cache():
+    global _BASELINES_CACHE
+    _BASELINES_CACHE = None
+
+
+def compute_confidence_score(record: Any, features: Any | None = None, config: Config | None = None) -> float:
     """
     Derive a 0–1 confidence score from field completeness and scraper-suspect flags.
 
@@ -92,6 +140,7 @@ def compute_confidence_score(record: Any, features: Any | None = None) -> float:
     mismapping are currently unreliable — when those flags fire, confidence
     must drop so a numeric "clear" is never presented as trustworthy.
     """
+    cfg = config or _default_cfg
     src = features if features is not None else record
 
     completeness = _get_nested(src, "structural", "field_completeness", default=None)
@@ -101,6 +150,18 @@ def compute_confidence_score(record: Any, features: Any | None = None) -> float:
         completeness = record.get("field_completeness")
     if completeness is None:
         completeness = 0.5  # unknown completeness → mid confidence baseline
+
+    # Source-conditioned completeness logic
+    if cfg.confidence.enable_source_conditioning:
+        source = _get_source(record)
+        if source:
+            baselines = load_source_baselines(cfg.confidence.source_baseline_path)
+            source_data = baselines.get(source)
+            if source_data and isinstance(source_data, dict):
+                mean_comp = source_data.get("mean_completeness", 0.0)
+                if mean_comp > 0.0:
+                    target = cfg.confidence.global_completeness_target
+                    completeness = min(1.0, completeness * (target / mean_comp))
 
     confidence = float(max(0.0, min(1.0, completeness)))
 
@@ -203,16 +264,19 @@ def _build_explanation_summary(
 
 class RiskEngine:
     """
-    Blend rules + anomaly scores into a final ScamScoreResult.
+    Blend rules + anomaly + supervised scores into a final ScamScoreResult.
 
     Parameters
     ----------
     config:
         Optional config override (weights, thresholds, hard-DQ policy).
+    calibrator:
+        Optional ScoreCalibrator instance (or None to load automatically from config).
     """
 
-    def __init__(self, config: Config | None = None) -> None:
+    def __init__(self, config: Config | None = None, calibrator: Any | None = None) -> None:
         self._cfg = config or _default_cfg
+        self._calibrator = calibrator
 
     def score_record(
         self,
@@ -221,7 +285,10 @@ class RiskEngine:
         anomaly_score: float,
         confidence_score: float,
         *,
+        supervised_score: float | None = None,
+        reputation_score: float | None = None,
         feature_contributions: list[tuple[str, float]] | None = None,
+        explanation_method: str = "shap",
     ) -> ScamScoreResult:
         """
         Produce the final Scam Score for one internship record.
@@ -237,6 +304,8 @@ class RiskEngine:
             Unsupervised anomaly score in ``[0, 1]`` from Prompt 7.
         confidence_score:
             Pre-computed confidence in ``[0, 1]`` (see ``compute_confidence_score``).
+        supervised_score:
+            Optional supervised scam probability in ``[0, 1]``.
         feature_contributions:
             Optional anomaly ``explain()`` pairs ``(feature, magnitude)`` for
             the reviewer report / ``top_contributing_features``.
@@ -250,13 +319,46 @@ class RiskEngine:
 
         rw = cfg.blend_weights.rules_weight
         aw = cfg.blend_weights.anomaly_weight
-        total_w = rw + aw
-        if total_w <= 0:
-            rw, aw, total_w = 0.60, 0.40, 1.0
-        rw, aw = rw / total_w, aw / total_w
+        sw = getattr(cfg.blend_weights, "supervised_weight", 0.0)
+        rep_w = getattr(cfg.blend_weights, "reputation_weight", 0.10)
 
-        blended_01 = rw * rules_score + aw * anomaly
-        scam_score = round(blended_01 * 100.0, 2)
+        use_supervised = supervised_score is not None and (
+            sw > 0.0 or cfg.flags.enable_ml_risk_engine
+        )
+        use_reputation = reputation_score is not None
+
+        # Build dict of active weights
+        active_weights = {
+            "rules": rw,
+            "anomaly": aw,
+        }
+        if use_supervised and supervised_score is not None:
+            active_weights["supervised"] = sw if sw > 0.0 else 0.40
+        if use_reputation and reputation_score is not None:
+            active_weights["reputation"] = rep_w
+
+        total_w = sum(active_weights.values())
+        if total_w <= 0:
+            active_weights = {"rules": 0.50, "anomaly": 0.40}
+            if use_reputation:
+                active_weights["reputation"] = 0.10
+            total_w = sum(active_weights.values())
+
+        blended_01 = (active_weights["rules"] / total_w) * rules_score + (active_weights["anomaly"] / total_w) * anomaly
+        if "supervised" in active_weights and supervised_score is not None:
+            blended_01 += (active_weights["supervised"] / total_w) * float(supervised_score)
+        if "reputation" in active_weights and reputation_score is not None:
+            blended_01 += (active_weights["reputation"] / total_w) * float(reputation_score)
+
+        # Calibrate score mapping (falls back to raw blended_01 if no calibration model exists)
+        if self._calibrator is not None:
+            calibrated_01 = self._calibrator.calibrate(blended_01)
+        else:
+            from scam_detector.scoring.calibration import ScoreCalibrator
+            calibrator = ScoreCalibrator(config=cfg)
+            calibrated_01 = calibrator.calibrate(blended_01)
+
+        scam_score = round(calibrated_01 * 100.0, 2)
 
         triggered = list(rule_result.triggered)
         triggered_ids = list(rule_result.triggered_rule_ids) or [
@@ -291,9 +393,14 @@ class RiskEngine:
 
         contributions: list[tuple[str, float]]
         if feature_contributions is not None:
-            contributions = [
+            # feature_contributions holds the FULL feature vector (all ~49
+            # features, many at 0.0) — rank by absolute impact and cap to a
+            # legible top-N rather than dumping everything into the report.
+            all_contributions = [
                 (str(name), float(val)) for name, val in feature_contributions
             ]
+            all_contributions.sort(key=lambda item: abs(item[1]), reverse=True)
+            contributions = all_contributions[:_TOP_CONTRIBUTING_FEATURES_LIMIT]
         else:
             # Fall back to triggered rule weights as contributing signals
             contributions = [
@@ -315,10 +422,13 @@ class RiskEngine:
             decision=decision,
             triggered_rules=triggered_ids,
             top_contributing_features=contributions,
+            explanation_method=explanation_method,
             explanation_summary=summary,
             triggered_rule_findings=list(triggered),
             rules_score=rules_score,
             anomaly_score=anomaly,
+            supervised_score=supervised_score if use_supervised else None,
+            reputation_score=reputation_score if use_reputation else None,
             hard_disqualifying_forced=hard_forced,
             low_confidence_forced_review=low_conf_forced,
         )
