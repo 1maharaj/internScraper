@@ -296,6 +296,17 @@ def main(selected_ids: list[str] | None = None, skip_scrape: bool = False, max_v
     # Phase 2: Push to DB
     totals = push_all_to_db(internships)
 
+    # Phase 3: auto-approved listings are vectorized + graph-indexed by the HF vectorizer
+    # (pending/rejected ones stay in staging for the moderator). Best-effort, async server-side.
+    vec_url = os.environ.get("VECTORIZER_URL")
+    if vec_url and totals["saved"]:
+        try:
+            import requests
+            requests.post(f"{vec_url.rstrip('/')}/vectorize-hnsw", json={"background": True}, timeout=15)
+            log.info("🧭 Vectorizer triggered for auto-approved listings")
+        except Exception as exc:
+            log.warning("Vectorizer trigger failed (%s) — approved items will be picked up on the next run", exc)
+
     # Summary
     log.info("\n━━━ Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info("✅ Saved to DB:   %d", totals["saved"])

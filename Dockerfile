@@ -85,9 +85,10 @@ COPY --chown=user . $HOME/app
 RUN mkdir -p $HOME/app/data
 
 # ─── Runtime ──────────────────────────────────────────────────────────────────
-EXPOSE 7860
+EXPOSE 10000
 
 # MONGODB_URI and COHERE_API_KEY must be set as Secrets in the HF Space settings.
 # They are injected automatically as environment variables at runtime.
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1"]
+# Render injects $PORT (default 10000); fall back to 7860 for local/other hosts.
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-7860} --workers 1"]

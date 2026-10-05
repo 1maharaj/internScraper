@@ -66,9 +66,14 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Allowed browser origins: local dev servers (3000-3004) + MAIN_SERVER (comma-separated, may be empty).
+ALLOWED_ORIGINS = [f"http://localhost:{p}" for p in range(3000, 3005)] + [
+    f"http://127.0.0.1:{p}" for p in range(3000, 3005)
+] + [o.strip().rstrip("/") for o in os.environ.get("MAIN_SERVER", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )

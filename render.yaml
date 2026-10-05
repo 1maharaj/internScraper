@@ -1,0 +1,19 @@
+# Render Blueprint — New + → Blueprint → select this repo.
+services:
+  - type: web
+    name: ifind-scraper
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard            # Chrome + scam_detector (pandas/sklearn) need ~2 GB; free/starter (512 MB) will OOM
+    region: singapore         # pick the region closest to your MongoDB Atlas cluster
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: MONGODB_URI
+        sync: false           # set in dashboard
+      - key: COHERE_API_KEY
+        sync: false
+      - key: VECTORIZER_URL
+        sync: false           # base URL of the vectorizer service
+      - key: MAIN_SERVER
+        sync: false           # frontend origin(s), comma-separated; localhost:3000-3004 are always allowed

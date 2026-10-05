@@ -282,6 +282,16 @@ def score_internship(name: str, company: str, apply_link: str, summary: str, ski
     return score
 
 
+# Top-level keys scam_detector.process_records adds; the useful parts are
+# folded into doc["moderation"]["scamDetails"], so they must not leak into staging.
+_DETECTOR_EXTRA_KEYS = (
+    "scam_score", "decision", "confidence", "explanation_summary", "confidence_level",
+    "triggered_rules", "top_contributing_features", "risk_breakdown",
+    "hard_disqualifying_forced", "low_confidence_forced_review",
+    "shared_infrastructure", "duplicate_cluster_network_size",
+)
+
+
 # ─── Main pipeline function ───────────────────────────────────────────────────
 
 def push_to_pipeline(
@@ -327,7 +337,8 @@ def push_to_pipeline(
 
             # ── Deduplication ─────────────────────────────────────────────
             fingerprint = generate_fingerprint(company, name, city)
-            if col.find_one({"fingerprint": fingerprint}):
+            # Approved listings leave staging, so dedupe against the live collection too.
+            if col.find_one({"fingerprint": fingerprint}) or col.database["internships"].find_one({"fingerprint": fingerprint}, {"_id": 1}):
                 log.debug("  ⏭  Duplicate: '%s' @ %s", name, company)
                 stats["duplicate"] += 1
                 continue
@@ -455,6 +466,10 @@ def push_to_pipeline(
                 "rejectionReason": summary_exp if decision == "block" else None,
                 "scamDetails":     scam_details,
             }
+
+            # Staging schema: listing + moderation only (no vectors, no loose detector fields).
+            for k in _DETECTOR_EXTRA_KEYS:
+                doc.pop(k, None)
 
             col.insert_one(doc)
             log.info("  ✅ [%s] scam_score:%.1f — '%s' @ %s", mod_status, scam_score, doc["name"], doc["company"])
