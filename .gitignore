@@ -7,3 +7,5 @@ __pycache__/
 data/
 scrapers/**/__pycache__/
 scrapers/**/*.json
+
+.env.local
