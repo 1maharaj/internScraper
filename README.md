@@ -10,10 +10,15 @@ Selenium scrapers and listens on Render's `$PORT`.
 ## Pipeline
 
 ```
-POST /scrape → scrapers (Selenium/HTTP) → validate required fields → SHA-256 fingerprint dedup
-  (vs staging AND live `internships`) → scam_detector → insert into  internships.mod-unvectorised
-  → POST {VECTORIZER_URL}/vectorize-hnsw   (best effort; vectorizes auto-approved items)
+POST /scrape → for each scraper, one after another:
+    scrape → validate required fields → SHA-256 fingerprint dedup (vs staging AND live `internships`)
+          → scam_detector → insert into  internships.mod-unvectorised
+          → POST {VECTORIZER_URL}/vectorize-hnsw   (best effort; publishes auto-approved items)
 ```
+
+Results are saved **per scraper, as soon as that scraper finishes** (not at the end of the whole run), so a
+crash, restart or out-of-memory kill loses at most the scraper that was running. Listings are scored in
+one batch per scraper; duplicate and peer-group checks in the detector work within that batch.
 
 Scam-detector decision → `moderation.status` on the staged document:
 
@@ -94,7 +99,8 @@ Errors: `400` for an unknown scraper id, a non-positive max, or an entry that is
 }
 ```
 
-`stats` (set when `done`): `saved` = inserted into staging, `duplicate` = fingerprint already in
+`stats` is updated **live after each scraper finishes** (so you can watch `saved` grow while the job is still
+`running`) and is final when `done`. It also includes `scraped` (items returned by scrapers). Fields: `saved` = inserted into staging, `duplicate` = fingerprint already in
 staging or live, `rejected` = missing name/company/link/summary or non-http link, `errors` = unexpected
 per-item failures. `404` if the job id is unknown.
 

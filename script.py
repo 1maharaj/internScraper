@@ -175,57 +175,13 @@ def run_scraper(scraper: dict, max_items: int = DEFAULT_MAX) -> list:
         return []
 
 
-# ─── Main orchestrator ────────────────────────────────────────────────────────
+# ─── DB helpers ───────────────────────────────────────────────────────────────
 
-def run_all_scrapers(selected_ids: list[str], max_values: dict[str, int] | None = None) -> list:
-    """
-    Run all selected scrapers sequentially.
-    max_values: optional per-scraper overrides, e.g. {"github": 50, "naukri": 200}
-    Falls back to DEFAULT_MAX for any scraper not in max_values.
-    """
-    all_internships = load_checkpoint()
-    already_scraped_count = len(all_internships)
-
-    active = [s for s in SCRAPER_REGISTRY if s["id"] in selected_ids]
-
-    log.info("\n╔══════════════════════════════════════════════════╗")
-    log.info("║         iFind Scraper Orchestrator               ║")
-    log.info("╚══════════════════════════════════════════════════╝")
-    log.info("Scrapers: %s", ", ".join(s["label"] for s in active))
-    log.info("Resuming from checkpoint: %d existing internships\n", already_scraped_count)
-
-    for scraper in active:
-        max_items = (max_values or {}).get(scraper["id"], DEFAULT_MAX)
-        log.info("━━━ %s (max: %d) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", scraper["label"], max_items)
-        items = run_scraper(scraper, max_items=max_items)
-
-        if not items:
-            log.warning("  No internships returned from %s", scraper["label"])
-            continue
-
-        for item in items:
-            item["_scraper_source"] = scraper["source"]
-            item["_scraper_id"]     = scraper["id"]
-
-        log.info("  ✓ %s returned %d internships", scraper["label"], len(items))
-        all_internships.extend(items)
-        save_checkpoint(all_internships)
-
-    log.info("\n📊 Total scraped: %d internships", len(all_internships))
-    return all_internships
-
-
-# ─── DB push ──────────────────────────────────────────────────────────────────
-
-def push_all_to_db(internships: list) -> dict:
-    """
-    Push all scraped internships through the moderation pipeline into MongoDB.
-    Returns aggregate stats.
-    """
+def _open_staging():
+    """Connect to MongoDB and return (client, staging collection)."""
     from dotenv import load_dotenv
     import pymongo
 
-    # Load .env from Scraper directory
     env_path = SCRAPER_DIR / ".env"
     if env_path.exists():
         load_dotenv(env_path)
@@ -238,41 +194,133 @@ def push_all_to_db(internships: list) -> dict:
 
     log.info("\n🔌 Connecting to MongoDB...")
     client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
-    db  = client["ifind"]
-    col = db["internships.mod-unvectorised"]
+    col = client["ifind"]["internships.mod-unvectorised"]
     log.info("✅ Connected\n")
+    return client, col
 
+
+def _push_batch(items: list, scraper_id: str, col) -> dict:
+    """Run one scraper's items through dedup + scam detection and save to staging."""
     from pipeline import push_to_pipeline
+
+    source = items[0].get("_scraper_source", "web_scraping")
+    log.info("▶ Moderation pipeline: %s (%d items)", scraper_id, len(items))
+    stats = push_to_pipeline(items, source, col, label=scraper_id)
+    log.info(
+        "  → saved:%d  dupes:%d  rejected:%d  errors:%d",
+        stats["saved"], stats["duplicate"], stats["rejected"], stats["errors"],
+    )
+    return stats
+
+
+def _trigger_vectorizer() -> None:
+    """Auto-approved listings are vectorized + graph-indexed by the vectorizer service (best effort)."""
+    vec_url = os.environ.get("VECTORIZER_URL")
+    if not vec_url:
+        return
+    try:
+        import requests
+        requests.post(f"{vec_url.rstrip('/')}/vectorize-hnsw", json={"background": True}, timeout=15)
+        log.info("🧭 Vectorizer triggered for auto-approved listings")
+    except Exception as exc:
+        log.warning("Vectorizer trigger failed (%s) — approved items will be picked up on the next run", exc)
+
+
+# ─── Main orchestrator ────────────────────────────────────────────────────────
+
+def run_streaming(
+    selected_ids: list[str],
+    max_values: dict[str, int] | None = None,
+    on_progress=None,
+) -> dict:
+    """
+    Scrape → scam-check → save, one scraper at a time. Each scraper's results are saved to
+    staging as soon as that scraper finishes, so a crash or restart loses at most the scraper
+    that was running, never the ones already done.
+
+    max_values:  per-scraper overrides, e.g. {"github": 50, "naukri": 200}
+    on_progress: optional callback(totals_dict) after every scraper (used for live job status)
+    """
+    active = [s for s in SCRAPER_REGISTRY if s["id"] in selected_ids]
+
+    log.info("\n╔══════════════════════════════════════════════════╗")
+    log.info("║         iFind Scraper Orchestrator               ║")
+    log.info("╚══════════════════════════════════════════════════╝")
+    log.info("Scrapers: %s\n", ", ".join(s["label"] for s in active))
+
+    client, col = _open_staging()
+    totals = {"saved": 0, "duplicate": 0, "rejected": 0, "errors": 0, "scraped": 0}
+    scraped_all: list = []   # kept only as an offline checkpoint for --skip-scrape
+
+    try:
+        for scraper in active:
+            max_items = (max_values or {}).get(scraper["id"], DEFAULT_MAX)
+            log.info("━━━ %s (max: %d) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", scraper["label"], max_items)
+            items = run_scraper(scraper, max_items=max_items)
+
+            if not items:
+                log.warning("  No internships returned from %s", scraper["label"])
+                continue
+
+            for item in items:
+                item["_scraper_source"] = scraper["source"]
+                item["_scraper_id"]     = scraper["id"]
+            log.info("  ✓ %s returned %d internships", scraper["label"], len(items))
+            totals["scraped"] += len(items)
+            scraped_all.extend(items)
+            save_checkpoint(scraped_all)
+
+            try:
+                stats = _push_batch(items, scraper["id"], col)
+                for k in ("saved", "duplicate", "rejected", "errors"):
+                    totals[k] += stats[k]
+                if stats["saved"]:
+                    _trigger_vectorizer()
+            except Exception as exc:
+                log.exception("  💥 Pipeline failed for %s: %s", scraper["id"], exc)
+                totals["errors"] += len(items)
+
+            if on_progress:
+                on_progress(dict(totals))
+    finally:
+        client.close()
+
+    return totals
+
+
+# ─── Offline re-push (checkpoint) ─────────────────────────────────────────────
+
+def push_all_to_db(internships: list) -> dict:
+    """Push an already-scraped list (checkpoint) through the moderation pipeline."""
     from collections import defaultdict
 
+    client, col = _open_staging()
     totals = {"saved": 0, "duplicate": 0, "rejected": 0, "errors": 0}
 
-    # Group by scraper_id so each batch goes through the pipeline
-    # with its own source label and gets logged separately
     by_scraper: dict[str, list] = defaultdict(list)
     for item in internships:
-        scraper_id = item.get("_scraper_id", "unknown")
-        by_scraper[scraper_id].append(item)
+        by_scraper[item.get("_scraper_id", "unknown")].append(item)
 
-    log.info("━━━ Moderation Pipeline ━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    for scraper_id, batch in by_scraper.items():
-        source = batch[0].get("_scraper_source", "web_scraping")
-        log.info("▶ %s (%d items)", scraper_id, len(batch))
-        stats = push_to_pipeline(batch, source, col, label=scraper_id)
-        log.info(
-            "  → saved:%d  dupes:%d  rejected:%d  errors:%d",
-            stats["saved"], stats["duplicate"], stats["rejected"], stats["errors"],
-        )
-        for k in totals:
-            totals[k] += stats[k]
-
-    client.close()
+    try:
+        for scraper_id, batch in by_scraper.items():
+            stats = _push_batch(batch, scraper_id, col)
+            for k in totals:
+                totals[k] += stats[k]
+    finally:
+        client.close()
+    if totals["saved"]:
+        _trigger_vectorizer()
     return totals
 
 
 # ─── CLI entry point ──────────────────────────────────────────────────────────
 
-def main(selected_ids: list[str] | None = None, skip_scrape: bool = False, max_values: dict[str, int] | None = None) -> dict:
+def main(
+    selected_ids: list[str] | None = None,
+    skip_scrape: bool = False,
+    max_values: dict[str, int] | None = None,
+    on_progress=None,
+) -> dict:
     """
     Main entry point — can be called from CLI or from app.py.
     max_values: per-scraper overrides, e.g. {"github": 50, "naukri": 200}
@@ -286,28 +334,10 @@ def main(selected_ids: list[str] | None = None, skip_scrape: bool = False, max_v
         if not internships:
             log.warning("No checkpoint found and --skip-scrape was set. Nothing to push.")
             return {"saved": 0, "duplicate": 0, "rejected": 0, "errors": 0}
+        totals = push_all_to_db(internships)
     else:
-        internships = run_all_scrapers(selected_ids, max_values=max_values)
+        totals = run_streaming(selected_ids, max_values=max_values, on_progress=on_progress)
 
-    if not internships:
-        log.warning("No internships to push.")
-        return {"saved": 0, "duplicate": 0, "rejected": 0, "errors": 0}
-
-    # Phase 2: Push to DB
-    totals = push_all_to_db(internships)
-
-    # Phase 3: auto-approved listings are vectorized + graph-indexed by the HF vectorizer
-    # (pending/rejected ones stay in staging for the moderator). Best-effort, async server-side.
-    vec_url = os.environ.get("VECTORIZER_URL")
-    if vec_url and totals["saved"]:
-        try:
-            import requests
-            requests.post(f"{vec_url.rstrip('/')}/vectorize-hnsw", json={"background": True}, timeout=15)
-            log.info("🧭 Vectorizer triggered for auto-approved listings")
-        except Exception as exc:
-            log.warning("Vectorizer trigger failed (%s) — approved items will be picked up on the next run", exc)
-
-    # Summary
     log.info("\n━━━ Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info("✅ Saved to DB:   %d", totals["saved"])
     log.info("⏭  Duplicates:   %d", totals["duplicate"])

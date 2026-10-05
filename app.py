@@ -121,7 +121,11 @@ def _run_job(job_id: str, scrapers: list[str], skip_scrape: bool, max_values: di
 
     try:
         from script import main as run_pipeline
-        stats = run_pipeline(selected_ids=scrapers, skip_scrape=skip_scrape, max_values=max_values)
+        def _progress(partial: dict):
+            with _jobs_lock:
+                _jobs[job_id]["stats"] = partial   # live totals after each scraper finishes
+
+        stats = run_pipeline(selected_ids=scrapers, skip_scrape=skip_scrape, max_values=max_values, on_progress=_progress)
 
         with _jobs_lock:
             _jobs[job_id].update({
