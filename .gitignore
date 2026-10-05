@@ -9,3 +9,5 @@ scrapers/**/__pycache__/
 scrapers/**/*.json
 
 .env.local
+**/.env.local
+**/.env
