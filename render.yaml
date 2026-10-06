@@ -13,11 +13,11 @@ services:
         sync: false           # set in dashboard
       - key: COHERE_API_KEY
         sync: false
-      - key: VECTORIZER_URL
+      - key: VECTORISER_URL
         sync: false           # base URL of the vectorizer service
       - key: FIRST_PARTY_DOMAINS
         sync: false           # iFind's own domains, comma-separated (used by POST /process)
       - key: INTERNSCRAPER_API_KEY
         sync: false           # optional shared secret for POST /process (x-api-key header)
-      - key: MAIN_SERVER
-        sync: false           # frontend origin(s), comma-separated; localhost:3000-3004 are always allowed
+      - key: MAIN_URL
+        sync: false           # main project origin(s), comma-separated (add http://localhost:3000 for dev)

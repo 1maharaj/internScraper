@@ -176,14 +176,17 @@ sends `companyVerified: true`; otherwise a clear listing comes back `pending_rev
 
 | Where | Variable | Purpose |
 |---|---|---|
-| internScraper | `VECTORIZER_URL` | the vectoriser; called after scraping and after an auto-approved employer post |
+| internScraper | `VECTORISER_URL` | the vectoriser; called after scraping and after an auto-approved employer post |
 | internScraper | `MONGODB_URI` | also used by `/process` to record verdicts on `internships.this-platform` |
 | internScraper | `FIRST_PARTY_DOMAINS` | iFind's own domains (e.g. `ifind.app`, `localhost:3000` in dev). Without it every employer post looks off-platform and scores into review |
 | internScraper | `INTERNSCRAPER_API_KEY` | optional; if set, `/process` requires the `x-api-key` header |
 | ifind | `INTERNSCRAPER_URL` | internScraper; unset means every employer post waits for a moderator |
 | ifind | `INTERNSCRAPER_API_KEY` | sent as `x-api-key` when set |
-| ifind | `VECTORIZER_URL` | the vectoriser, for moderator approvals, resume changes and the admin refresh |
+| ifind | `VECTORISER_URL` | the vectoriser, for moderator approvals, resume changes and the admin refresh |
 | vectoriser | `MONGODB_URI` | required: it reads and writes internships, the graph and students |
+| vectoriser | `MAIN_PROJECT_URL`, `INTERNSCRAPER_URL` | origins allowed by CORS (comma-separated); nothing is allowed when unset. Server-to-server calls are unaffected |
+| internScraper | `MAIN_URL` | the main project's origin(s) for CORS |
+| ifind | `RESUME_EXTRACTOR_URL` | resume extractor (future use: tried before the OpenAI/Gemini fallbacks) |
 
 ## 5. Known weak spots
 

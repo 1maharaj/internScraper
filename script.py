@@ -19,6 +19,7 @@ import os
 import json
 import logging
 import argparse
+from services import vectoriser_url
 import time
 from pathlib import Path
 from datetime import datetime, timezone
@@ -218,12 +219,12 @@ def _push_batch(items: list, scraper_id: str, col) -> dict:
 
 def _trigger_vectorizer() -> None:
     """Auto-approved listings are vectorized + graph-indexed by the vectorizer service (best effort)."""
-    vec_url = os.environ.get("VECTORIZER_URL")
+    vec_url = vectoriser_url()
     if not vec_url:
         return
     try:
         import requests
-        requests.post(f"{vec_url.rstrip('/')}/vectorize-hnsw", json={"background": True}, timeout=15)
+        requests.post(f"{vec_url}/vectorize-hnsw", json={"background": True}, timeout=15)
         log.info("🧭 Vectorizer triggered for auto-approved listings")
     except Exception as exc:
         log.warning("Vectorizer trigger failed (%s) — approved items will be picked up on the next run", exc)
@@ -251,7 +252,7 @@ class RunLog:
                 "finishedAt": None,
                 "durationSeconds": None,
                 "requested": requested,                # {scraper_id: max_items}
-                "vectorizerConfigured": bool(os.environ.get("VECTORIZER_URL")),
+                "vectorizerConfigured": bool(vectoriser_url()),
                 "totals": {},
                 "sources": [],
             }).inserted_id

@@ -13,7 +13,7 @@ Selenium scrapers and listens on Render's `$PORT`.
 POST /scrape → for each scraper, one after another:
     scrape → validate required fields → SHA-256 fingerprint dedup (vs staging AND live `internships`)
           → scam_detector → insert into  internships.mod-unvectorised
-          → POST {VECTORIZER_URL}/vectorize-hnsw   (best effort; vectorizes + graph-indexes auto-approved items,
+          → POST {VECTORISER_URL}/vectorize-hnsw   (best effort; vectorizes + graph-indexes auto-approved items,
                                                      then the vectoriser re-runs every student through the graph)
 ```
 
@@ -43,7 +43,7 @@ no vectors; those are added by the vectorizer when the listing is published.
 **Platform path.** Employer-posted internships use the same validation and scam detection through
 `POST /process`. The document belongs to ifind (`internships.this-platform`), so nothing is staged here: the verdict
 goes back to the caller, and for an existing document that is still `pending_review` it is also written onto it.
-Auto-approved posts are then sent to the vectoriser (`POST {VECTORIZER_URL}/vectorize-platform`), which vectorizes them
+Auto-approved posts are then sent to the vectoriser (`POST {VECTORISER_URL}/vectorize-platform`), which vectorizes them
 in place, adds them to the graph and re-runs every student through it.
 The full flow for both paths is drawn in [`pipeline-diagram.md`](pipeline-diagram.md).
 
@@ -166,7 +166,7 @@ Response `200`:
 
 For `source: "ifind"`, when `id` is a document in `internships.this-platform` that is still `pending_review`, the
 verdict (`moderation.status`, score, flags, rejection reason, scam details) is written onto it (`persisted: true`) and, if
-auto-approved, `{VECTORIZER_URL}/vectorize-platform` is called in the background (`vectorizerTriggered: true`). A document a
+auto-approved, `{VECTORISER_URL}/vectorize-platform` is called in the background (`vectorizerTriggered: true`). A document a
 moderator already decided is never overwritten.
 
 `results[i]` matches the i-th input. `outcome` is `scored`, `rejected` (`reason`: `missing_required_fields` or
@@ -188,10 +188,10 @@ Set in the Render dashboard (**Environment**); `sync: false` entries in `render.
 |--------|----------|-------------|
 | `MONGODB_URI` | yes | MongoDB Atlas connection string (database `ifind`) |
 | `COHERE_API_KEY` | for GitHub / Indeed / Internshala | AI enrichment |
-| `MAIN_SERVER` | optional | Frontend origin(s) allowed by CORS, comma-separated (e.g. `https://ifind.example.com`). `http://localhost:3000`–`3004` (and `127.0.0.1`) are always allowed. Empty is fine. |
+| `MAIN_URL` | optional | The main project (ifind): browser origin(s) allowed by CORS, comma-separated (e.g. `https://ifind.example.com,http://localhost:3000`). Nothing is allowed by default. The old name `MAIN_SERVER` is still read when this is unset. |
 | `FIRST_PARTY_DOMAINS` | for `/process` | iFind's own domains, comma-separated (e.g. `ifind.app`; `localhost:3000` in dev). Employer listings link to iFind itself; without this the scam detector treats that link as an off-platform domain and scores every employer post into review. Exact domain or real subdomain only. |
 | `INTERNSCRAPER_API_KEY` | optional | If set, `POST /process` requires it in the `x-api-key` header. |
-| `VECTORIZER_URL` | recommended | Base URL of the vectoriser service (`tf-idfs+berts/vectoriser`). After a push, `POST {VECTORIZER_URL}/vectorize-hnsw` vectorizes and graph-indexes auto-approved listings, and the vectoriser re-runs every student through the graph. `/process` calls `/vectorize-platform` the same way for auto-approved employer posts. Unset → they wait until the vectorizer is triggered some other way. |
+| `VECTORISER_URL` | recommended | Base URL of the vectoriser service (`tf-idfs+berts/vectoriser`). After a push, `POST {VECTORISER_URL}/vectorize-hnsw` vectorizes and graph-indexes auto-approved listings, and the vectoriser re-runs every student through the graph. `/process` calls `/vectorize-platform` the same way for auto-approved employer posts. Unset → they wait until the vectorizer is triggered some other way. |
 
 ## Deploying to Render
 

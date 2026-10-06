@@ -724,13 +724,14 @@ def _platform_collection():
 
 
 def _trigger_platform_vectorizer(ids: list) -> bool:
-    """POST {VECTORIZER_URL}/vectorize-platform: vectorize in place, add to the graph, run every student through it."""
-    url = os.environ.get("VECTORIZER_URL")
+    """POST {VECTORISER_URL}/vectorize-platform: vectorize in place, add to the graph, run every student through it."""
+    from services import vectoriser_url
+    url = vectoriser_url()
     if not url or not ids:
         return False
     try:
         import requests
-        res = requests.post(f"{url.rstrip('/')}/vectorize-platform", json={"ids": ids, "background": True}, timeout=60)
+        res = requests.post(f"{url}/vectorize-platform", json={"ids": ids, "background": True}, timeout=60)
         res.raise_for_status()
         log.info("🧭 Vectorizer triggered for %d auto-approved employer post(s)", len(ids))
         return True
