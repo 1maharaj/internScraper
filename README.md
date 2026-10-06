@@ -13,7 +13,8 @@ Selenium scrapers and listens on Render's `$PORT`.
 POST /scrape → for each scraper, one after another:
     scrape → validate required fields → SHA-256 fingerprint dedup (vs staging AND live `internships`)
           → scam_detector → insert into  internships.mod-unvectorised
-          → POST {VECTORIZER_URL}/vectorize-hnsw   (best effort; publishes auto-approved items)
+          → POST {VECTORIZER_URL}/vectorize-hnsw   (best effort; vectorizes + graph-indexes auto-approved items,
+                                                     then the vectoriser re-runs every student through the graph)
 ```
 
 Results are saved **per scraper, as soon as that scraper finishes** (not at the end of the whole run), so a
@@ -34,6 +35,31 @@ Each staged document contains the listing fields plus `moderation` (`status`, `s
 `flags`, `source`, `reviewedBy`, `reviewedAt`, `rejectionReason`, `scamDetails`). It carries
 no vectors; those are added by the vectorizer when the listing is published.
 
+**Source.** Every listing carries `source`: the scraper id (`github`, `internshala`, `indeed`, `naukri`,
+`unstop`, `freshersworld`, `letsintern`) or `ifind` for internships employers post on our own platform.
+`moderation.source` says how it arrived (`web_scraping` or `employer`). Older documents still say
+`source: "web_scraping"`; `python backfill_source.py` (dry run) / `--apply` replaces it with the real scraper id.
+
+**Platform path.** Employer-posted internships use the same validation and scam detection through
+`POST /process`. The document belongs to ifind (`internships.this-platform`), so nothing is staged here: the verdict
+goes back to the caller, and for an existing document that is still `pending_review` it is also written onto it.
+Auto-approved posts are then sent to the vectoriser (`POST {VECTORIZER_URL}/vectorize-platform`), which vectorizes them
+in place, adds them to the graph and re-runs every student through it.
+The full flow for both paths is drawn in [`pipeline-diagram.md`](pipeline-diagram.md).
+
+## Run log (`ifind.scrape.runs`)
+
+Every run writes one document, updated after each scraper (a crash keeps what finished). Top level:
+`jobId`, `trigger` (`scrape`/`checkpoint`), `status` (`running`/`done`/`failed`), `startedAt`, `finishedAt`,
+`durationSeconds`, `requested` (`{scraper: max}`), `totals`, `error`, `sources[]`.
+
+Each `sources[]` entry (one per scraper): `scraped`, `saved`, `duplicate`, `rejected`
+(+ `rejectedMissingFields`, `rejectedBadUrl`), `errors`, `scrapeSeconds`, `pipelineSeconds`, `detectorSeconds`,
+`scraperError` / `pipelineError` / `detectorFailed` / `emptyResult` (reliability), `statusCounts`
+(auto_approved / pending_review / auto_rejected), `decisionCounts`, `scoreHistogram` (ten buckets `0-10` … `90-100`),
+`lowConfidence`, `hardDisqualified`, `topTriggeredRules`, `uniqueCompanies`, `stipend` (paid/unpaid/performanceBased),
+`remote`, `noSkills`, `noDeadline`. Averages and rates are not stored; compute them on read.
+
 ## Endpoints
 
 Base URL: `https://<service>.onrender.com` · Interactive docs: `/docs` (Swagger), `/redoc`, `/openapi.json`
@@ -44,6 +70,7 @@ Base URL: `https://<service>.onrender.com` · Interactive docs: `/docs` (Swagger
 | `POST` | `/scrape` | Start a background scrape job → **202** with `job_id` |
 | `GET`  | `/scrape/{job_id}` | Poll a job's status and stats |
 | `GET`  | `/scrape` | List all jobs, newest first |
+| `POST` | `/process` | Scam-check one internship or a batch (platform path); returns verdicts, records them on the ifind document and sends auto-approved posts to the vectoriser |
 
 There is no auth on these endpoints. Anyone with the URL can start a scrape; keep the service
 private or put a gateway in front of it.
@@ -110,6 +137,43 @@ per-item failures. `404` if the job id is unknown.
 {"jobs": [{"job_id": "…", "status": "done", "started_at": "…", "finished_at": "…", "stats": {…}, "error": null}], "total": 1}
 ```
 
+### `POST /process`
+
+For internships posted on our own platform. Synchronous, 1 to 50 items per call. For `source: "ifind"` each item should
+carry the ifind document's `id` and `companyVerified` (boolean): a post is auto-approved only when `companyVerified` is
+exactly `true`, otherwise a clear listing comes back `pending_review` with the flag `unverified_company`.
+
+```json
+{ "source": "ifind", "internship": { "id": "abc", "name": "...", "company": "...", "applyLink": "https://...", "summary": "..." } }
+```
+or `"internships": [ {...}, {...} ]`. `source` defaults to `ifind` and must be one of the sources above.
+Item fields are the same loose shape the scrapers produce (`name`/`title`, `applyLink`/`apply_link`,
+`summary`/`description`, `city`/`location`, `skills`, `stipend`, `duration`, `deadline_date`, ...).
+
+Response `200`:
+
+```json
+{
+  "source": "ifind", "count": 1, "detectorFailed": false,
+  "summary": { "auto_approved": 1, "pending_review": 0, "auto_rejected": 0, "rejected": 0, "errors": 0 },
+  "results": [ {
+    "index": 0, "id": "abc", "outcome": "scored", "reason": null,
+    "moderationStatus": "auto_approved", "score": 5.4, "decision": "clear", "confidence": 0.8,
+    "flags": [], "rejectionReason": null, "fingerprint": "...", "scamDetails": { "...": "..." }
+  } ]
+}
+```
+
+For `source: "ifind"`, when `id` is a document in `internships.this-platform` that is still `pending_review`, the
+verdict (`moderation.status`, score, flags, rejection reason, scam details) is written onto it (`persisted: true`) and, if
+auto-approved, `{VECTORIZER_URL}/vectorize-platform` is called in the background (`vectorizerTriggered: true`). A document a
+moderator already decided is never overwritten.
+
+`results[i]` matches the i-th input. `outcome` is `scored`, `rejected` (`reason`: `missing_required_fields` or
+`invalid_url`) or `error`. No de-duplication is done here (employers may repost). If the detector fails, every
+item comes back `pending_review`. `400` for an unknown source, no items, or more than 50; `401` when
+`INTERNSCRAPER_API_KEY` is set and the `x-api-key` header does not match.
+
 ### Notes
 
 - Jobs are stored **in memory** (single instance, `--workers 1`). They disappear on restart or when
@@ -125,7 +189,9 @@ Set in the Render dashboard (**Environment**); `sync: false` entries in `render.
 | `MONGODB_URI` | yes | MongoDB Atlas connection string (database `ifind`) |
 | `COHERE_API_KEY` | for GitHub / Indeed / Internshala | AI enrichment |
 | `MAIN_SERVER` | optional | Frontend origin(s) allowed by CORS, comma-separated (e.g. `https://ifind.example.com`). `http://localhost:3000`–`3004` (and `127.0.0.1`) are always allowed. Empty is fine. |
-| `VECTORIZER_URL` | recommended | Base URL of the `vectorisationResume` service. After a push, `POST {VECTORIZER_URL}/vectorize-hnsw` publishes auto-approved listings. Unset → they wait until the vectorizer is triggered some other way. |
+| `FIRST_PARTY_DOMAINS` | for `/process` | iFind's own domains, comma-separated (e.g. `ifind.app`; `localhost:3000` in dev). Employer listings link to iFind itself; without this the scam detector treats that link as an off-platform domain and scores every employer post into review. Exact domain or real subdomain only. |
+| `INTERNSCRAPER_API_KEY` | optional | If set, `POST /process` requires it in the `x-api-key` header. |
+| `VECTORIZER_URL` | recommended | Base URL of the vectoriser service (`tf-idfs+berts/vectoriser`). After a push, `POST {VECTORIZER_URL}/vectorize-hnsw` vectorizes and graph-indexes auto-approved listings, and the vectoriser re-runs every student through the graph. `/process` calls `/vectorize-platform` the same way for auto-approved employer posts. Unset → they wait until the vectorizer is triggered some other way. |
 
 ## Deploying to Render
 

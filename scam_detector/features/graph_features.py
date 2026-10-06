@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 import networkx as nx
-import matplotlib.pyplot as plt
 
 from scam_detector.features.duplicate_detection import DuplicateIndex, _record_id
 from scam_detector.features.url_features import (
@@ -167,6 +166,8 @@ def export_largest_components_visualization(
     Export a visual representation of the largest connected components in the graph
     to a static image using matplotlib, and optionally save as GraphML.
     """
+    import matplotlib.pyplot as plt  # lazy: plotting only; not a runtime dependency
+
     # 1. Save GraphML if requested
     if output_graphml_path:
         nx.write_graphml(graph, output_graphml_path)

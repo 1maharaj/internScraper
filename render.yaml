@@ -15,5 +15,9 @@ services:
         sync: false
       - key: VECTORIZER_URL
         sync: false           # base URL of the vectorizer service
+      - key: FIRST_PARTY_DOMAINS
+        sync: false           # iFind's own domains, comma-separated (used by POST /process)
+      - key: INTERNSCRAPER_API_KEY
+        sync: false           # optional shared secret for POST /process (x-api-key header)
       - key: MAIN_SERVER
         sync: false           # frontend origin(s), comma-separated; localhost:3000-3004 are always allowed

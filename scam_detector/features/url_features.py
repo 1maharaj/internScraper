@@ -80,6 +80,16 @@ _PLATFORM_DOMAINS: list[str] = [
     "internshala.app",
 ]
 
+def _first_party_domains() -> list[str]:
+    """
+    Our own platform's domains (env FIRST_PARTY_DOMAINS, comma-separated, e.g. "ifind.app,localhost").
+    Listings posted by employers on iFind link to iFind itself, so that link is platform-internal,
+    not an off-platform domain that should resemble the company name. Empty by default: no change for scraped data.
+    """
+    import os
+    return [d.strip().lower() for d in os.environ.get("FIRST_PARTY_DOMAINS", "").split(",") if d.strip()]
+
+
 # Known Applicant Tracking System domains — do NOT penalise these.
 _ATS_DOMAINS: list[str] = [
     "greenhouse.io",
@@ -277,6 +287,12 @@ def is_platform_internal_link(
         # Also handle subdomain-of-platform (e.g. careers.internshala.com)
         if reg_domain.lower().endswith(platform_lc):
             return True
+
+    # Our own domains: exact or real subdomain only ("myifind.app" must not pass as "ifind.app")
+    if known_platform_domains is None:
+        for fp in _first_party_domains():
+            if reg_domain.lower() == fp or reg_domain.lower().endswith("." + fp) or full_with_sub.lower() == fp:
+                return True
 
     return False
 

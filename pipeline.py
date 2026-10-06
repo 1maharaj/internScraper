@@ -1,14 +1,20 @@
 """
 pipeline.py — Moderation pipeline integrated with scam_detector
 
-Validates, deduplicates, runs scam detection, normalizes internships to the
-canonical Internship schema defined in ifind/types/internship.ts, and stores
-them in the MongoDB collection 'internships.mod-unvectorised'.
+Validates, deduplicates, runs scam detection and normalizes internships to the
+canonical Internship schema defined in ifind/types/internship.ts.
+
+Two entry points share the same stages (see pipeline-diagram.md):
+  push_to_pipeline()      scraper path: stores the results in 'internships.mod-unvectorised'
+  evaluate_internships()  platform path (source "ifind"): returns the verdicts, stores nothing
 """
 
+import os
 import re
 import hashlib
 import logging
+import time
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Literal, TypedDict, Any, Dict
 
@@ -70,15 +76,19 @@ class ModerationDict(TypedDict, total=False):
     status: Literal["auto_approved", "pending_review", "auto_rejected", "manually_approved", "manually_rejected"]
     score: Optional[float]
     flags: List[str]
-    source: Literal["web_scraping", "api", "user_contributed", "email_parsing", "rss", "community_bot", "manual"]
+    source: Literal["web_scraping", "api", "user_contributed", "email_parsing", "rss", "community_bot", "manual", "employer"]
     reviewedBy: Optional[str]
     reviewedAt: Optional[str]
     rejectionReason: Optional[str]
     scamDetails: Optional[ScamDetailsDict]
 
 
+InternshipSource = Literal["github", "internshala", "indeed", "naukri", "unstop", "freshersworld", "letsintern", "ifind"]
+
+
 class InternshipDict(TypedDict, total=False):
     _id: Optional[str]
+    _ix: int   # position in the input batch (internal; removed before storing)
     name: str
     company: str
     applyLink: str
@@ -99,7 +109,7 @@ class InternshipDict(TypedDict, total=False):
     responsibilities: Optional[List[str]]
     perks: Optional[List[str]]
     tags: Optional[List[str]]
-    source: Optional[str]
+    source: InternshipSource
     isActive: bool
     fingerprint: Optional[str]
     linkVerification: Optional[LinkVerificationDict]
@@ -289,33 +299,88 @@ _DETECTOR_EXTRA_KEYS = (
     "triggered_rules", "top_contributing_features", "risk_breakdown",
     "hard_disqualifying_forced", "low_confidence_forced_review",
     "shared_infrastructure", "duplicate_cluster_network_size",
+    "_ix",
 )
 
 
-# ─── Main pipeline function ───────────────────────────────────────────────────
+_HIST_KEYS = [f"{i * 10}-{i * 10 + 10}" for i in range(10)]
 
-def push_to_pipeline(
-    items: list,
-    source: str,
-    col: Collection,
-    label: str = "",
-) -> dict:
+
+def _new_detail() -> dict:
+    return {
+        "validated": 0,
+        "rejectedMissingFields": 0,
+        "rejectedBadUrl": 0,
+        "detectorFailed": False,
+        "detectorError": None,
+        "detectorSeconds": None,
+        "statusCounts": {"auto_approved": 0, "pending_review": 0, "auto_rejected": 0},
+        "decisionCounts": {"clear": 0, "review": 0, "block": 0},
+        "scoreHistogram": {k: 0 for k in _HIST_KEYS},   # scam-score buckets; averages are computed on read
+        "lowConfidence": 0,
+        "hardDisqualified": 0,
+        "stipend": {"paid": 0, "unpaid": 0, "performanceBased": 0},
+        "remote": 0,
+        "noSkills": 0,
+        "noDeadline": 0,
+        "topTriggeredRules": {},
+        "uniqueCompanies": 0,
+    }
+
+
+def _record_saved(detail, doc, meta, flag_counts, companies) -> None:
+    detail["statusCounts"][meta["status"]] += 1
+    detail["decisionCounts"][meta["decision"] if meta["decision"] in detail["decisionCounts"] else "review"] += 1
+    detail["scoreHistogram"][_HIST_KEYS[min(max(int(meta["score"] // 10), 0), 9)]] += 1
+    if meta["lowConfidence"]:
+        detail["lowConfidence"] += 1
+    if meta["hardDisqualified"]:
+        detail["hardDisqualified"] += 1
+    stype = (doc.get("stipend") or {}).get("type")
+    key = {"paid": "paid", "unpaid": "unpaid", "performance-based": "performanceBased"}.get(stype)
+    if key:
+        detail["stipend"][key] += 1
+    detail["remote"] += bool(doc.get("isRemote"))
+    detail["noSkills"] += not doc.get("skills")
+    detail["noDeadline"] += not doc.get("deadlineDate")
+    flag_counts.update(meta["rules"])
+    companies.add(str(doc.get("company", "")).lower())
+
+
+# ─── Sources ──────────────────────────────────────────────────────────────────
+
+# Where an internship came from: one of the scrapers, or "ifind" (posted by an employer on our own platform).
+INTERNSHIP_SOURCES = ("github", "internshala", "indeed", "naukri", "unstop", "freshersworld", "letsintern", "ifind")
+
+STAGING_COLLECTION = "internships.mod-unvectorised"
+LIVE_COLLECTION = "internships"
+PLATFORM_COLLECTION = "internships.this-platform"   # employer-posted (source "ifind"); written by ifind, never staged here
+
+
+def _check_source(source: str) -> str:
+    if source not in INTERNSHIP_SOURCES:
+        raise ValueError(f"Unknown source '{source}'. Expected one of: {', '.join(INTERNSHIP_SOURCES)}")
+    return source
+
+
+def _moderation_source(source: str) -> str:
+    """moderation.source says how the listing arrived, not which site it came from."""
+    return "employer" if source == "ifind" else "web_scraping"
+
+
+# ─── Pipeline stages (shared by push_to_pipeline and evaluate_internships) ────
+
+def _prepare_candidates(items: list, source: str, is_duplicate, stats: dict, detail: dict, outcomes: dict) -> list:
     """
-    Process a list of raw scraped internships through basic validation,
-    scam detection, and normalization into canonical Internship schema,
-    storing passing records in collection 'internships.mod-unvectorised'.
+    Stage 1: validate, de-duplicate and normalize raw items into canonical candidate docs.
 
-    Returns stats dict: {saved, duplicate, rejected, errors}
+    Each candidate carries `_ix` (its position in `items`) so a result can be matched back to its input.
+    `is_duplicate(fingerprint) -> bool`; None skips de-duplication (employers may repost).
+    `outcomes[ix]` records why an item produced no candidate.
     """
-    stats = {"saved": 0, "duplicate": 0, "rejected": 0, "errors": 0}
+    candidates: list[dict] = []
 
-    # Ensure collection points to 'internships.mod-unvectorised'
-    if col.name != "internships.mod-unvectorised":
-        col = col.database["internships.mod-unvectorised"]
-
-    valid_candidates: list[dict] = []
-
-    for item in items:
+    for ix, item in enumerate(items):
         try:
             name       = normalize_name(item)
             company    = (item.get("company") or "").strip()
@@ -328,19 +393,23 @@ def push_to_pipeline(
             if not name or not company or not apply_link or not summary:
                 log.debug("  ⚠  Skipping '%s' — missing required fields", name or "unnamed")
                 stats["rejected"] += 1
+                detail["rejectedMissingFields"] += 1
+                outcomes[ix] = {"outcome": "rejected", "reason": "missing_required_fields"}
                 continue
 
             if not apply_link.startswith("http"):
                 log.debug("  ⚠  Skipping '%s' — invalid URL: %s", name, apply_link)
                 stats["rejected"] += 1
+                detail["rejectedBadUrl"] += 1
+                outcomes[ix] = {"outcome": "rejected", "reason": "invalid_url"}
                 continue
 
             # ── Deduplication ─────────────────────────────────────────────
             fingerprint = generate_fingerprint(company, name, city)
-            # Approved listings leave staging, so dedupe against the live collection too.
-            if col.find_one({"fingerprint": fingerprint}) or col.database["internships"].find_one({"fingerprint": fingerprint}, {"_id": 1}):
+            if is_duplicate and is_duplicate(fingerprint):
                 log.debug("  ⏭  Duplicate: '%s' @ %s", name, company)
                 stats["duplicate"] += 1
+                outcomes[ix] = {"outcome": "duplicate", "reason": "duplicate", "fingerprint": fingerprint}
                 continue
 
             # ── Normalize sub-fields ──────────────────────────────────────
@@ -369,10 +438,10 @@ def push_to_pipeline(
             )
 
             now_iso = datetime.now(timezone.utc).isoformat()
-            next_check_iso = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
 
             # Construct InternshipDict matching canonical TS schema
             candidate_doc: InternshipDict = {
+                "_ix":                ix,
                 "name":               name,
                 "company":            company,
                 "applyLink":          apply_link,
@@ -405,23 +474,34 @@ def push_to_pipeline(
                 "updatedAt":           now_iso,
             }
 
-            valid_candidates.append(candidate_doc)
+            candidates.append(candidate_doc)
 
         except Exception as e:
             log.error("  💥 Error processing '%s': %s", item.get("name") or item.get("title", "?"), e)
             stats["errors"] += 1
+            outcomes[ix] = {"outcome": "error", "reason": f"{type(e).__name__}: {e}"[:200]}
 
-    if not valid_candidates:
-        return stats
+    return candidates
 
-    # ── Run scam_detector pipeline ──────────────────────────────────────────
+
+def _score_candidates(candidates: list, detail: dict) -> list:
+    """Stage 2: scam_detector. Fails closed: if it breaks, nothing is auto-approved."""
     try:
         from scam_detector.pipeline import process_records
-        scored_candidates = process_records(valid_candidates)
+        t0 = time.monotonic()
+        scored = process_records(candidates)
+        detail["detectorSeconds"] = round(time.monotonic() - t0, 2)
+        # Keep results matched to inputs even if the detector rebuilt the dicts
+        if len(scored) == len(candidates):
+            for s, c in zip(scored, candidates):
+                s.setdefault("_ix", c["_ix"])
+        return scored
     except Exception as exc:
+        detail["detectorFailed"] = True
+        detail["detectorError"] = str(exc)[:300]
         # Fail closed: an unscored posting must never be auto-approved.
         log.warning("Scam detector processing failed (%s) — routing all to manual review", exc)
-        scored_candidates = [
+        return [
             {
                 **c,
                 "scam_score": 50.0,
@@ -429,54 +509,275 @@ def push_to_pipeline(
                 "confidence": 0.0,
                 "explanation_summary": "Scam detector unavailable; manual review required.",
             }
-            for c in valid_candidates
+            for c in candidates
         ]
+
+
+def _assemble_moderation(doc: dict, source: str) -> dict:
+    """
+    Stage 3: fold the detector output into doc["moderation"] and drop detector-only keys.
+    Returns {status, decision, score, rules, lowConfidence, hardDisqualified} for stats and results.
+    """
+    scam_score = float(doc.get("scam_score", 0.0))
+    decision = doc.get("decision", "review")  # "clear" | "review" | "block"
+    confidence = float(doc.get("confidence", 1.0))
+    summary_exp = str(doc.get("explanation_summary", ""))
+
+    raw_flags = []
+    if isinstance(doc.get("moderation"), dict):
+        raw_flags = doc["moderation"].get("flags") or []
+
+    scam_details: ScamDetailsDict = {
+        "score":              scam_score,
+        "decision":           decision if decision in ("clear", "review", "block") else "review",
+        "confidence":         confidence,
+        "explanationSummary": summary_exp,
+        "scamFlags":          raw_flags,
+        "evaluatedAt":        datetime.now(timezone.utc).isoformat(),
+        "riskBreakdown":      {"anomalyScore": (doc.get("risk_breakdown") or {}).get("anomaly_score")},
+    }
+
+    mod_status = {"clear": "auto_approved", "block": "auto_rejected"}.get(decision, "pending_review")
+
+    doc["moderation"] = {
+        "status":          mod_status,
+        "score":           scam_score,
+        "flags":           raw_flags,
+        "source":          _moderation_source(source),
+        "reviewedBy":      None,
+        "reviewedAt":      datetime.now(timezone.utc).isoformat(),
+        "rejectionReason": summary_exp if decision == "block" else None,
+        "scamDetails":     scam_details,
+    }
+
+    # Read before the pop below
+    rules = [str(r) for r in (doc.get("triggered_rules") or [])]
+    meta = {
+        "status": mod_status, "decision": decision, "score": scam_score, "rules": rules,
+        "lowConfidence": bool(doc.get("low_confidence_forced_review")),
+        "hardDisqualified": bool(doc.get("hard_disqualifying_forced")),
+    }
+    for k in _DETECTOR_EXTRA_KEYS:
+        doc.pop(k, None)
+    return meta
+
+
+# ─── Pipeline entry points ────────────────────────────────────────────────────
+
+def push_to_pipeline(
+    items: list,
+    source: str,
+    col: Collection,
+    label: str = "",
+) -> dict:
+    """
+    Scraper path. Process raw scraped internships through validation, de-duplication,
+    scam detection and normalization into the canonical Internship schema, storing the
+    ones that pass in collection 'internships.mod-unvectorised'.
+
+    `source` is the scraper id (github, internshala, ...), stored on every document.
+
+    Returns stats dict: {saved, duplicate, rejected, errors, detail}
+    `detail` is the per-batch breakdown stored in `scrape.runs` (see _new_detail).
+    """
+    _check_source(source)
+    if source == "ifind":
+        raise ValueError("'ifind' internships live in ifind's own collection and are never staged; use evaluate_internships()")
+
+    stats = {"saved": 0, "duplicate": 0, "rejected": 0, "errors": 0}
+    detail = stats["detail"] = _new_detail()
+    companies: set = set()
+    flag_counts: Counter = Counter()
+
+    # Ensure collection points to 'internships.mod-unvectorised'
+    if col.name != STAGING_COLLECTION:
+        col = col.database[STAGING_COLLECTION]
+    db = col.database
+
+    def is_duplicate(fp: str) -> bool:
+        # Approved listings leave staging, so also check the live collection, and employer-posted
+        # internships (so a scraped copy of an employer's posting is not listed twice).
+        return bool(
+            col.find_one({"fingerprint": fp}, {"_id": 1})
+            or db[LIVE_COLLECTION].find_one({"fingerprint": fp}, {"_id": 1})
+            or db[PLATFORM_COLLECTION].find_one({"fingerprint": fp}, {"_id": 1})
+        )
+
+    outcomes: dict = {}
+    valid_candidates = _prepare_candidates(items, source, is_duplicate, stats, detail, outcomes)
+    if not valid_candidates:
+        return stats
+    detail["validated"] = len(valid_candidates)
+
+    scored_candidates = _score_candidates(valid_candidates, detail)
 
     # ── Final Moderation assembly & insertion into MongoDB ──────────────────
     for doc in scored_candidates:
         try:
-            scam_score = float(doc.get("scam_score", 0.0))
-            decision = doc.get("decision", "review")  # "clear" | "review" | "block"
-            confidence = float(doc.get("confidence", 1.0))
-            summary_exp = str(doc.get("explanation_summary", ""))
-
-            raw_flags = []
-            if isinstance(doc.get("moderation"), dict):
-                raw_flags = doc["moderation"].get("flags") or []
-
-            scam_details: ScamDetailsDict = {
-                "score":              scam_score,
-                "decision":           decision if decision in ("clear", "review", "block") else "review",
-                "confidence":         confidence,
-                "explanationSummary": summary_exp,
-                "scamFlags":          raw_flags,
-                "evaluatedAt":        datetime.now(timezone.utc).isoformat(),
-                "riskBreakdown":      {"anomalyScore": (doc.get("risk_breakdown") or {}).get("anomaly_score")},
-            }
-
-            mod_status = {"clear": "auto_approved", "block": "auto_rejected"}.get(decision, "pending_review")
-
-            doc["moderation"] = {
-                "status":          mod_status,
-                "score":           scam_score,
-                "flags":           raw_flags,
-                "source":          source if source in ("web_scraping", "api", "user_contributed", "email_parsing", "rss", "community_bot", "manual") else "web_scraping",
-                "reviewedBy":      None,
-                "reviewedAt":      datetime.now(timezone.utc).isoformat(),
-                "rejectionReason": summary_exp if decision == "block" else None,
-                "scamDetails":     scam_details,
-            }
-
-            # Staging schema: listing + moderation only (no vectors, no loose detector fields).
-            for k in _DETECTOR_EXTRA_KEYS:
-                doc.pop(k, None)
+            meta = _assemble_moderation(doc, source)
+            doc.pop("_ix", None)
 
             col.insert_one(doc)
-            log.info("  ✅ [%s] scam_score:%.1f — '%s' @ %s", mod_status, scam_score, doc["name"], doc["company"])
+            _record_saved(detail, doc, meta, flag_counts, companies)
+            log.info("  ✅ [%s] scam_score:%.1f — '%s' @ %s", meta["status"], meta["score"], doc["name"], doc["company"])
             stats["saved"] += 1
 
         except Exception as e:
             log.error("  💥 Error inserting '%s': %s", doc.get("name", "?"), e)
             stats["errors"] += 1
 
+    detail["uniqueCompanies"] = len(companies)
+    detail["topTriggeredRules"] = dict(flag_counts.most_common(15))
     return stats
+
+
+def evaluate_internships(items: list, source: str = "ifind") -> dict:
+    """
+    Platform path (e.g. employer-posted internships). Runs the same validation, normalization and
+    scam detection as the scraper path, but stores nothing and does no de-duplication: the caller
+    owns the document and decides what to do with the verdict.
+
+    Returns {source, count, summary, detectorFailed, results}; `results[i]` matches `items[i]`:
+      outcome  "scored" | "rejected" | "error"
+      reason   why an item was not scored (missing_required_fields, invalid_url, ...)
+      moderationStatus  auto_approved | pending_review | auto_rejected (only when scored)
+      score, decision, confidence, flags, rejectionReason, scamDetails, fingerprint
+    """
+    _check_source(source)
+    stats = {"saved": 0, "duplicate": 0, "rejected": 0, "errors": 0}
+    detail = _new_detail()
+    outcomes: dict = {}
+
+    candidates = _prepare_candidates(items, source, None, stats, detail, outcomes)
+    scored = _score_candidates(candidates, detail) if candidates else []
+
+    results: list = [None] * len(items)
+    for doc in scored:
+        ix = doc.get("_ix")
+        if ix is None:
+            continue
+        try:
+            meta = _assemble_moderation(doc, source)
+            mod = doc["moderation"]
+            results[ix] = {
+                "outcome": "scored",
+                "reason": None,
+                "moderationStatus": meta["status"],
+                "score": meta["score"],
+                "decision": meta["decision"],
+                "confidence": mod["scamDetails"]["confidence"],
+                "flags": mod["flags"],
+                "rejectionReason": mod["rejectionReason"],
+                "scamDetails": mod["scamDetails"],
+                "fingerprint": doc.get("fingerprint"),
+            }
+        except Exception as e:
+            log.error("  💥 Error assembling result for '%s': %s", doc.get("name", "?"), e)
+            outcomes[ix] = {"outcome": "error", "reason": f"{type(e).__name__}: {e}"[:200]}
+
+    for ix, item in enumerate(items):
+        base = {"index": ix, "id": item.get("id") or item.get("_id") or item.get("platformId")}
+        results[ix] = {**base, **(results[ix] or outcomes.get(ix) or {"outcome": "error", "reason": "not processed"})}
+        r = results[ix]
+        # An employer post is only auto-approved for a verified company. The caller must say so with
+        # companyVerified: true; anything else (missing included) is treated as unverified.
+        if source == "ifind" and r["outcome"] == "scored" and r["moderationStatus"] == "auto_approved" and item.get("companyVerified") is not True:
+            r["moderationStatus"] = "pending_review"
+            r["flags"] = [*(r.get("flags") or []), "unverified_company"]
+            if r.get("scamDetails"):
+                r["scamDetails"] = {**r["scamDetails"], "scamFlags": r["flags"]}
+
+    summary = {"auto_approved": 0, "pending_review": 0, "auto_rejected": 0, "rejected": 0, "errors": 0}
+    for r in results:
+        if r["outcome"] == "scored":
+            summary[r["moderationStatus"]] += 1
+        elif r["outcome"] == "rejected":
+            summary["rejected"] += 1
+        else:
+            summary["errors"] += 1
+
+    return {
+        "source": source,
+        "count": len(items),
+        "summary": summary,
+        "detectorFailed": detail["detectorFailed"],
+        "results": results,
+    }
+
+
+# ─── Platform path: record the verdict and hand auto-approved posts to the vectoriser ───
+
+_platform_col = None
+
+
+def _platform_collection():
+    """'internships.this-platform' (written by ifind). None when MONGODB_URI is not configured."""
+    global _platform_col
+    if _platform_col is None:
+        uri = os.environ.get("MONGODB_URI")
+        if not uri:
+            return None
+        import pymongo
+        client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=10000)
+        _platform_col = client[os.environ.get("MONGODB_DB_NAME", "ifind")][PLATFORM_COLLECTION]
+    return _platform_col
+
+
+def _trigger_platform_vectorizer(ids: list) -> bool:
+    """POST {VECTORIZER_URL}/vectorize-platform: vectorize in place, add to the graph, run every student through it."""
+    url = os.environ.get("VECTORIZER_URL")
+    if not url or not ids:
+        return False
+    try:
+        import requests
+        res = requests.post(f"{url.rstrip('/')}/vectorize-platform", json={"ids": ids, "background": True}, timeout=60)
+        res.raise_for_status()
+        log.info("🧭 Vectorizer triggered for %d auto-approved employer post(s)", len(ids))
+        return True
+    except Exception as exc:
+        log.warning("Vectorizer trigger failed (%s): the ifind admin refresh will pick the posts up", exc)
+        return False
+
+
+def apply_platform_verdicts(result: dict) -> dict:
+    """
+    For source "ifind": write each scored verdict onto its document in 'internships.this-platform' (only while it
+    is still pending_review, so a moderator's decision is never overwritten), then send the auto-approved ones
+    to the vectoriser in the background. Adds `persisted` / `vectorizerTriggered` to each result.
+    ifind still saves the same verdict on its own copy; writing it here first means the vectoriser, which only
+    processes approved documents, never races ifind's save.
+    """
+    import threading
+    from bson import ObjectId
+
+    col = _platform_collection()
+    approved: list = []
+    for r in result.get("results", []):
+        r["persisted"] = False
+        r["vectorizerTriggered"] = False
+        rid = r.get("id")
+        if col is None or r.get("outcome") != "scored" or not rid or not ObjectId.is_valid(str(rid)):
+            continue
+        try:
+            upd = col.update_one(
+                {"_id": ObjectId(str(rid)), "moderation.status": "pending_review"},
+                {"$set": {
+                    "moderation.status": r["moderationStatus"],
+                    "moderation.source": "employer",
+                    "moderation.score": r["score"],
+                    "moderation.flags": r["flags"],
+                    "moderation.rejectionReason": r["rejectionReason"] if r["moderationStatus"] == "auto_rejected" else None,
+                    "moderation.scamDetails": r["scamDetails"],
+                }},
+            )
+            r["persisted"] = bool(upd.modified_count)
+            if r["persisted"] and r["moderationStatus"] == "auto_approved":
+                approved.append(str(rid))
+        except Exception as exc:
+            log.warning("Could not record the verdict for %s: %s", rid, exc)
+
+    if approved:
+        threading.Thread(target=_trigger_platform_vectorizer, args=(approved,), daemon=True).start()
+        for r in result["results"]:
+            r["vectorizerTriggered"] = str(r.get("id")) in approved
+    return result

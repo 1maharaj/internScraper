@@ -19,8 +19,9 @@ import os
 import json
 import logging
 import argparse
+import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 SCRAPER_DIR = Path(__file__).parent
@@ -34,6 +35,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("script")
+
+RUNS_COLLECTION = "scrape.runs"
 
 # ─── Default max per scraper ──────────────────────────────────────────────────
 DEFAULT_MAX = 300
@@ -131,11 +134,11 @@ def save_checkpoint(internships: list):
 
 # ─── Scraper runner ───────────────────────────────────────────────────────────
 
-def run_scraper(scraper: dict, max_items: int = DEFAULT_MAX) -> list:
+def run_scraper(scraper: dict, max_items: int = DEFAULT_MAX) -> tuple[list, str | None]:
     """
     Dynamically import and run a scraper module.
     Applies max_items according to each scraper's max_param strategy.
-    Returns a list of raw internship dicts.
+    Returns (raw internship dicts, error message or None).
     """
     scraper_dir_str = str(SCRAPER_DIR)
     if scraper_dir_str not in sys.path:
@@ -165,20 +168,20 @@ def run_scraper(scraper: dict, max_items: int = DEFAULT_MAX) -> list:
             result = fn()
 
         if result is None:
-            return []
+            return [], None
         if isinstance(result, list):
-            return result
+            return result, None
         log.warning("  Scraper '%s' returned unexpected type: %s", scraper["id"], type(result))
-        return []
+        return [], f"unexpected return type {type(result).__name__}"
     except Exception as e:
         log.error("  ❌ Scraper '%s' failed: %s", scraper["id"], e)
-        return []
+        return [], f"{type(e).__name__}: {e}"[:500]
 
 
 # ─── DB helpers ───────────────────────────────────────────────────────────────
 
 def _open_staging():
-    """Connect to MongoDB and return (client, staging collection)."""
+    """Connect to MongoDB and return (client, staging collection). Run logs: client["ifind"][RUNS_COLLECTION]."""
     from dotenv import load_dotenv
     import pymongo
 
@@ -203,9 +206,9 @@ def _push_batch(items: list, scraper_id: str, col) -> dict:
     """Run one scraper's items through dedup + scam detection and save to staging."""
     from pipeline import push_to_pipeline
 
-    source = items[0].get("_scraper_source", "web_scraping")
+    # `source` on every stored listing is the scraper id (github, indeed, ...), not the generic channel
     log.info("▶ Moderation pipeline: %s (%d items)", scraper_id, len(items))
-    stats = push_to_pipeline(items, source, col, label=scraper_id)
+    stats = push_to_pipeline(items, scraper_id, col, label=scraper_id)
     log.info(
         "  → saved:%d  dupes:%d  rejected:%d  errors:%d",
         stats["saved"], stats["duplicate"], stats["rejected"], stats["errors"],
@@ -226,12 +229,86 @@ def _trigger_vectorizer() -> None:
         log.warning("Vectorizer trigger failed (%s) — approved items will be picked up on the next run", exc)
 
 
+# ─── Run log (collection `scrape.runs`) ───────────────────────────────────────
+
+class RunLog:
+    """
+    One document per scrape run, one entry in `sources` per scraper. Written after every
+    scraper, so a crash still leaves everything finished so far. Best effort: a logging
+    failure must never stop scraping.
+    """
+
+    def __init__(self, client, trigger: str, requested: dict, job_id: str | None = None):
+        self.col = client["ifind"][RUNS_COLLECTION]
+        self.t0 = time.monotonic()
+        self.id = None
+        try:
+            self.id = self.col.insert_one({
+                "jobId": job_id,
+                "trigger": trigger,                    # "scrape" | "checkpoint"
+                "status": "running",
+                "startedAt": datetime.now(timezone.utc),
+                "finishedAt": None,
+                "durationSeconds": None,
+                "requested": requested,                # {scraper_id: max_items}
+                "vectorizerConfigured": bool(os.environ.get("VECTORIZER_URL")),
+                "totals": {},
+                "sources": [],
+            }).inserted_id
+        except Exception as exc:
+            log.warning("Run log disabled (%s)", exc)
+
+    def add_source(self, src: dict, totals: dict) -> None:
+        if self.id is None:
+            return
+        try:
+            self.col.update_one({"_id": self.id}, {"$push": {"sources": src}, "$set": {"totals": totals}})
+        except Exception as exc:
+            log.warning("Run log write failed (%s)", exc)
+
+    def finish(self, status: str, totals: dict, error: str | None = None) -> None:
+        if self.id is None:
+            return
+        try:
+            self.col.update_one({"_id": self.id}, {"$set": {
+                "status": status, "error": error, "totals": totals,
+                "finishedAt": datetime.now(timezone.utc),
+                "durationSeconds": round(time.monotonic() - self.t0, 1),
+            }})
+        except Exception as exc:
+            log.warning("Run log finish failed (%s)", exc)
+
+
+def _source_doc(scraper: dict, max_items, started: datetime, scraped: int, scrape_s: float,
+                scraper_error: str | None, stats: dict | None, pipeline_s: float,
+                pipeline_error: str | None) -> dict:
+    stats = stats or {}
+    return {
+        "id": scraper["id"],
+        "label": scraper["label"],
+        "maxRequested": max_items,
+        "startedAt": started,
+        "scrapeSeconds": round(scrape_s, 1),
+        "pipelineSeconds": round(pipeline_s, 1),
+        "scraped": scraped,
+        "scraperError": scraper_error,         # scraper crashed / returned junk
+        "pipelineError": pipeline_error,       # scoring/saving step crashed
+        "emptyResult": scraped == 0,
+        "saved": stats.get("saved", 0),
+        "duplicate": stats.get("duplicate", 0),
+        "rejected": stats.get("rejected", 0),
+        "errors": stats.get("errors", 0) + (scraped if pipeline_error else 0),
+        **(stats.get("detail") or {}),
+    }
+
+
 # ─── Main orchestrator ────────────────────────────────────────────────────────
 
 def run_streaming(
     selected_ids: list[str],
     max_values: dict[str, int] | None = None,
     on_progress=None,
+    job_id: str | None = None,
 ) -> dict:
     """
     Scrape → scam-check → save, one scraper at a time. Each scraper's results are saved to
@@ -251,15 +328,21 @@ def run_streaming(
     client, col = _open_staging()
     totals = {"saved": 0, "duplicate": 0, "rejected": 0, "errors": 0, "scraped": 0}
     scraped_all: list = []   # kept only as an offline checkpoint for --skip-scrape
+    runlog = RunLog(client, "scrape", {s["id"]: (max_values or {}).get(s["id"], DEFAULT_MAX) for s in active}, job_id)
+    run_status, run_error = "done", None
 
     try:
         for scraper in active:
             max_items = (max_values or {}).get(scraper["id"], DEFAULT_MAX)
             log.info("━━━ %s (max: %d) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", scraper["label"], max_items)
-            items = run_scraper(scraper, max_items=max_items)
+            started = datetime.now(timezone.utc)
+            t0 = time.monotonic()
+            items, scraper_error = run_scraper(scraper, max_items=max_items)
+            scrape_s = time.monotonic() - t0
 
             if not items:
                 log.warning("  No internships returned from %s", scraper["label"])
+                runlog.add_source(_source_doc(scraper, max_items, started, 0, scrape_s, scraper_error, None, 0, None), dict(totals))
                 continue
 
             for item in items:
@@ -270,6 +353,8 @@ def run_streaming(
             scraped_all.extend(items)
             save_checkpoint(scraped_all)
 
+            stats, pipeline_error = None, None
+            t1 = time.monotonic()
             try:
                 stats = _push_batch(items, scraper["id"], col)
                 for k in ("saved", "duplicate", "rejected", "errors"):
@@ -279,10 +364,20 @@ def run_streaming(
             except Exception as exc:
                 log.exception("  💥 Pipeline failed for %s: %s", scraper["id"], exc)
                 totals["errors"] += len(items)
+                pipeline_error = f"{type(exc).__name__}: {exc}"[:500]
+            runlog.add_source(
+                _source_doc(scraper, max_items, started, len(items), scrape_s, scraper_error, stats,
+                            time.monotonic() - t1, pipeline_error),
+                dict(totals),
+            )
 
             if on_progress:
                 on_progress(dict(totals))
+    except BaseException as exc:
+        run_status, run_error = "failed", f"{type(exc).__name__}: {exc}"[:500]
+        raise
     finally:
+        runlog.finish(run_status, dict(totals), run_error)
         client.close()
 
     return totals
@@ -290,7 +385,7 @@ def run_streaming(
 
 # ─── Offline re-push (checkpoint) ─────────────────────────────────────────────
 
-def push_all_to_db(internships: list) -> dict:
+def push_all_to_db(internships: list, job_id: str | None = None) -> dict:
     """Push an already-scraped list (checkpoint) through the moderation pipeline."""
     from collections import defaultdict
 
@@ -301,12 +396,26 @@ def push_all_to_db(internships: list) -> dict:
     for item in internships:
         by_scraper[item.get("_scraper_id", "unknown")].append(item)
 
+    runlog = RunLog(client, "checkpoint", {k: len(v) for k, v in by_scraper.items()}, job_id)
+    run_status, run_error = "done", None
+    labels = {s["id"]: s["label"] for s in SCRAPER_REGISTRY}
     try:
         for scraper_id, batch in by_scraper.items():
+            started = datetime.now(timezone.utc)
+            t1 = time.monotonic()
             stats = _push_batch(batch, scraper_id, col)
             for k in totals:
                 totals[k] += stats[k]
+            runlog.add_source(
+                _source_doc({"id": scraper_id, "label": labels.get(scraper_id, scraper_id)}, None, started,
+                            len(batch), 0.0, None, stats, time.monotonic() - t1, None),
+                dict(totals),
+            )
+    except BaseException as exc:
+        run_status, run_error = "failed", f"{type(exc).__name__}: {exc}"[:500]
+        raise
     finally:
+        runlog.finish(run_status, dict(totals), run_error)
         client.close()
     if totals["saved"]:
         _trigger_vectorizer()
@@ -320,6 +429,7 @@ def main(
     skip_scrape: bool = False,
     max_values: dict[str, int] | None = None,
     on_progress=None,
+    job_id: str | None = None,
 ) -> dict:
     """
     Main entry point — can be called from CLI or from app.py.
@@ -334,9 +444,9 @@ def main(
         if not internships:
             log.warning("No checkpoint found and --skip-scrape was set. Nothing to push.")
             return {"saved": 0, "duplicate": 0, "rejected": 0, "errors": 0}
-        totals = push_all_to_db(internships)
+        totals = push_all_to_db(internships, job_id=job_id)
     else:
-        totals = run_streaming(selected_ids, max_values=max_values, on_progress=on_progress)
+        totals = run_streaming(selected_ids, max_values=max_values, on_progress=on_progress, job_id=job_id)
 
     log.info("\n━━━ Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info("✅ Saved to DB:   %d", totals["saved"])

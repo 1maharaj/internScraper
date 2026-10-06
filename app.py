@@ -36,6 +36,15 @@ GET /scrape/{job_id}
       "error": "..." | null
     }
 
+POST /process        (platform path: internships posted on iFind itself)
+  Body:   { "source": "ifind", "internship": {...} }   or   { "source": "ifind", "internships": [{...}, ...] }
+  Runs the same validation + scam detection as the scraper path and returns the verdicts.
+  Synchronous, max 50 items per call. For source "ifind" send each item's ifind document `id` and `companyVerified`
+  (auto-approval needs exactly true). The verdict is written onto the document in internships.this-platform while it is
+  still pending_review, and auto-approved posts are sent to the vectoriser (/vectorize-platform) in the background.
+  Response 200: { "source", "count", "summary", "detectorFailed", "results": [ {index, id, outcome, moderationStatus, score, persisted, vectorizerTriggered, ...} ] }
+  If INTERNSCRAPER_API_KEY is set, send it as the x-api-key header.
+
 GET /health
   Response 200: { "status": "ok" }
 """
@@ -47,7 +56,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -103,6 +112,16 @@ class ScrapeRequest(BaseModel):
     skip_scrape: bool                       = False
 
 
+class ProcessRequest(BaseModel):
+    """One internship or a small batch, from one source (default "ifind")."""
+    source:      str                       = "ifind"
+    internship:  Optional[dict]            = None
+    internships: Optional[list[dict]]      = None
+
+
+MAX_PROCESS_BATCH = 50
+
+
 class JobStatus(BaseModel):
     job_id:      str
     status:      str                   # "running" | "done" | "failed"
@@ -125,7 +144,7 @@ def _run_job(job_id: str, scrapers: list[str], skip_scrape: bool, max_values: di
             with _jobs_lock:
                 _jobs[job_id]["stats"] = partial   # live totals after each scraper finishes
 
-        stats = run_pipeline(selected_ids=scrapers, skip_scrape=skip_scrape, max_values=max_values, on_progress=_progress)
+        stats = run_pipeline(selected_ids=scrapers, skip_scrape=skip_scrape, max_values=max_values, on_progress=_progress, job_id=job_id)
 
         with _jobs_lock:
             _jobs[job_id].update({
@@ -255,11 +274,40 @@ def list_jobs():
     return {"jobs": jobs, "total": len(jobs)}
 
 
+@app.post("/process")
+def process_internships(req: ProcessRequest, x_api_key: Optional[str] = Header(default=None)):
+    """Scam-check one internship or a batch (platform path); returns verdicts, records them on the ifind document and sends auto-approved posts to the vectoriser"""
+    expected = os.environ.get("INTERNSCRAPER_API_KEY")
+    if expected and x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
+
+    from pipeline import INTERNSHIP_SOURCES, evaluate_internships
+
+    if req.source not in INTERNSHIP_SOURCES:
+        raise HTTPException(status_code=400, detail=f"Unknown source '{req.source}'. Valid: {list(INTERNSHIP_SOURCES)}")
+    items = ([req.internship] if req.internship else []) + (req.internships or [])
+    if not items:
+        raise HTTPException(status_code=400, detail="Send 'internship' (one) or 'internships' (a list).")
+    if len(items) > MAX_PROCESS_BATCH:
+        raise HTTPException(status_code=400, detail=f"At most {MAX_PROCESS_BATCH} internships per call, got {len(items)}.")
+
+    try:
+        result = evaluate_internships(items, req.source)
+        if req.source == "ifind":
+            from pipeline import apply_platform_verdicts
+            result = apply_platform_verdicts(result)
+        return result
+    except Exception as exc:
+        log.exception("[process] failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # ─── Display Routes on Startup ────────────────────────────────────────────────
 
 ENDPOINT_DESCRIPTIONS = {
     "/health": "Liveness health check to verify service status",
     ("/scrape", "POST"): "Starts a background scraping job for selected internship sources",
+    ("/process", "POST"): "Scam-checks one internship or a batch (platform path); records the verdict and triggers the vectoriser",
     ("/scrape", "GET"): "Lists all recent scraping jobs and their overall execution status",
     "/scrape/{job_id}": "Polls status, progress, and stats of a specific scraping job",
     "/docs": "Interactive Swagger UI documentation and API testing dashboard",
