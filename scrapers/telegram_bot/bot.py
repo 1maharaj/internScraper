@@ -29,6 +29,8 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import requests
 from fastapi import APIRouter, Body, Header, HTTPException
 
+import usage_log
+
 from .extractor import extract_internships
 from .fetcher import Page, fetch_page
 from .parser import Post, parse_post, split_posts
@@ -170,6 +172,8 @@ def process_post(
     targets = _targets(post)
     if not targets:
         return ["❌ Rejected: no apply link or email address in this post"], False
+    if llm is None and usage_log.budget_exceeded():     # don't open pages we can't afford to read
+        return ["⏸️ Not processed: today's AI budget is used up. Send it again after midnight IST."], False
 
     lines: List[str] = []
     approved = False
@@ -230,7 +234,8 @@ def process_message(chat_id: int, text: str) -> None:
             log.warning("vectoriser trigger failed: %s", exc)
 
 
-def _run(chat_id: int, text: str) -> None:
+def _run(chat_id: int, text: str, sender: Optional[int] = None) -> None:
+    usage_log.actor.set(str(sender) if sender is not None else None)   # tags this thread's LLM calls with the Telegram user
     send_message(chat_id, "Got it, working on it…")   # in the thread so the webhook answers Telegram at once
     process_message(chat_id, text)
 
@@ -256,7 +261,7 @@ def handle_update(update: Dict) -> bool:
         send_message(chat_id, HELP)
         return False
 
-    threading.Thread(target=_run, args=(chat_id, text), daemon=True).start()
+    threading.Thread(target=_run, args=(chat_id, text, sender), daemon=True).start()
     return True
 
 

@@ -321,3 +321,32 @@ def test_webhook_starts_work_once_per_update(client):
 def test_not_configured_is_503(client, monkeypatch):
     monkeypatch.delenv("TELEGRAM_WEBHOOK_SECRET")
     assert client.post("/telegram/webhook", json=update(4)).status_code == 503
+
+
+# ─── daily AI budget ─────────────────────────────────────────────────────────
+
+def test_post_is_not_processed_once_the_daily_ai_budget_is_used_up(monkeypatch):
+    monkeypatch.setattr(bot.usage_log, "budget_exceeded", lambda: True)
+
+    def must_not_fetch(url):
+        raise AssertionError("opened a page although the budget is used up")
+
+    lines, approved = bot.process_post("Company: Acme\nRole: Intern\nhttps://acme.com/jobs/1", fetch=must_not_fetch)
+    assert approved is False
+    assert len(lines) == 1 and "budget" in lines[0] and "midnight IST" in lines[0]
+
+
+def test_extraction_reports_a_used_up_budget_in_plain_words():
+    def over_budget(prompt):
+        raise bot.usage_log.BudgetExceeded("daily AI budget of $3.00 reached")
+
+    items, error = extract_internships(parse_post("Company: Acme\nRole: Intern\nhttps://acme.com/jobs/1"), "https://acme.com/jobs/1", None, over_budget)
+    assert items == [] and "budget" in error and "midnight IST" in error
+
+
+def test_calls_are_tagged_with_the_telegram_user(monkeypatch):
+    seen = []
+    monkeypatch.setattr(bot, "send_message", lambda chat_id, text: None)
+    monkeypatch.setattr(bot, "process_message", lambda chat_id, text: seen.append(bot.usage_log.actor.get()))
+    bot._run(1, "hello", 4242)
+    assert seen == ["4242"]

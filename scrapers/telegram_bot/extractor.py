@@ -16,6 +16,8 @@ import re
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from usage_log import BudgetExceeded, tracked_chat
+
 from .fetcher import Page
 from .parser import Post
 
@@ -109,8 +111,8 @@ def _cohere_llm() -> Callable[[str], str]:
     co = cohere.Client(key)
 
     def call(prompt: str) -> str:
-        return co.chat(model=COHERE_MODEL, message=prompt, max_tokens=2500, temperature=0,
-                       response_format={"type": "json_object"}).text
+        return tracked_chat(co, "telegram", "extract", model=COHERE_MODEL, message=prompt, max_tokens=2500,
+                            temperature=0, response_format={"type": "json_object"}).text
     return call
 
 
@@ -177,6 +179,8 @@ def extract_internships(
         except ValueError as exc:       # malformed JSON (json.JSONDecodeError is a ValueError): ask once more
             log.info("model reply was not valid JSON (%s); retrying once", exc)
             data = _parse_json(call(prompt + f"\n\nYour previous reply was not valid JSON ({exc}). Reply with only the JSON object."))
+    except BudgetExceeded:
+        return [], "today's AI budget is used up (resets at midnight IST)"
     except Exception as exc:
         log.warning("extraction failed: %s", exc)
         return [], f"extraction failed ({type(exc).__name__})"
