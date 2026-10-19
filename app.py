@@ -61,12 +61,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("app")
+from ifind_log import RequestLogMiddleware, capture_print, get_logger, setup
+
+setup("internscraper")
+capture_print()  # scrapers and the scam detector use bare print(); route it through the same format
+log = get_logger("app")
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -79,6 +78,7 @@ app = FastAPI(
 from services import main_urls
 ALLOWED_ORIGINS = main_urls()
 
+app.add_middleware(RequestLogMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -317,15 +317,9 @@ ENDPOINT_DESCRIPTIONS = {
 
 @app.on_event("startup")
 def print_routes():
-    print("\n" + "=" * 105)
-    print(" >>> iFind Scraper API - Registered Endpoints & Descriptions")
-    print("=" * 105)
-    print(f"  {'HTTP METHOD':<14} {'ENDPOINT PATH':<24} {'DESCRIPTION'}")
-    print("  " + "-" * 101)
-
     for route in app.routes:
         if hasattr(route, "methods") and hasattr(route, "path"):
-            methods = ", ".join(sorted(route.methods))
+            methods = ",".join(sorted(route.methods))
             path = route.path
 
             primary_method = "POST" if "POST" in route.methods else "GET"
@@ -337,9 +331,8 @@ def print_routes():
                 desc = route.endpoint.__doc__.strip().splitlines()[0].strip()
             desc = desc or "No description available"
 
-            print(f"  {methods:<14} {path:<24} {desc}")
-
-    print("=" * 105 + "\n")
+            logging.getLogger("routes").info(desc, extra={"f": {"method": methods, "path": path}})
+    log.ok("internScraper API ready", extra={"f": {"scrapers": ",".join(ALL_SCRAPERS)}})
 
 
 
