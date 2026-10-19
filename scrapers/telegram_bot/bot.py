@@ -150,7 +150,7 @@ def _describe(item: dict, outcome: Tuple[str, Optional[str], Optional[float]]) -
         return f"↩️ Duplicate: {label}"
     if kind == "rejected":
         return f"❌ Rejected: {label} (missing details the pipeline needs)"
-    shown = f" (score {score:.0f})" if score is not None else ""
+    shown = f" (scam risk {score:.0f}/100)" if score is not None else ""
     verdict = {
         "auto_approved": "✅ Saved, auto-approved",
         "pending_review": "⏳ Saved, waiting for a moderator",

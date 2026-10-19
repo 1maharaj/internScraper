@@ -242,7 +242,7 @@ def test_process_post_saves_each_role_and_reports_the_outcome():
     llm = fake_llm({"company": "IBM", "roles": [{"name": "SWE Intern"}, {"name": "ML Intern"}]})
     lines, approved = bot.process_post("Role: Intern\nhttps://careers.ibm.com/x", fetch=ok_page, llm=llm, push=push)
     assert approved and len(pushed) == 2 and len(lines) == 2
-    assert lines[0] == '✅ Saved, auto-approved (score 12): "SWE Intern" at IBM'
+    assert lines[0] == '✅ Saved, auto-approved (scam risk 12/100): "SWE Intern" at IBM'
 
 
 def test_unreadable_page_means_not_saved():
@@ -265,7 +265,7 @@ def test_email_post_skips_the_page_fetch():
         fetch=lambda u: fetched.append(u), llm=llm, push=lambda i: (pushed.append(i), ("saved", "pending_review", 40.0))[1],
     )
     assert not fetched and pushed[0]["applyLink"] == "mailto:careers@foxo.club"
-    assert lines[0].startswith("⏳ Saved, waiting for a moderator (score 40)")
+    assert lines[0].startswith("⏳ Saved, waiting for a moderator (scam risk 40/100)")
 
 
 def test_duplicate_is_reported():
