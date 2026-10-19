@@ -109,7 +109,8 @@ def _cohere_llm() -> Callable[[str], str]:
     co = cohere.Client(key)
 
     def call(prompt: str) -> str:
-        return co.chat(model=COHERE_MODEL, message=prompt, max_tokens=2500, temperature=0).text
+        return co.chat(model=COHERE_MODEL, message=prompt, max_tokens=2500, temperature=0,
+                       response_format={"type": "json_object"}).text
     return call
 
 
@@ -170,7 +171,12 @@ def extract_internships(
     try:
         call = llm or _cohere_llm()
         page_text = page.text[:PAGE_CHARS] if page is not None and page.ok else "(no page: applied for by email)"
-        data = _parse_json(call(PROMPT.format(url=apply_link, page=page_text, message=post.text[:4000])))
+        prompt = PROMPT.format(url=apply_link, page=page_text, message=post.text[:4000])
+        try:
+            data = _parse_json(call(prompt))
+        except ValueError as exc:       # malformed JSON (json.JSONDecodeError is a ValueError): ask once more
+            log.info("model reply was not valid JSON (%s); retrying once", exc)
+            data = _parse_json(call(prompt + f"\n\nYour previous reply was not valid JSON ({exc}). Reply with only the JSON object."))
     except Exception as exc:
         log.warning("extraction failed: %s", exc)
         return [], f"extraction failed ({type(exc).__name__})"

@@ -165,6 +165,13 @@ def test_email_only_post_uses_mailto_and_email_domain_as_company():
     assert "linkVerification" not in items[0]
 
 
+def test_malformed_json_is_retried_once():
+    replies = iter(['{"company": "Acme", "roles": [{"name": "X"}',      # truncated
+                    '{"company": "Acme", "roles": [{"name": "SWE Intern"}]}'])
+    items, err = extract_internships(parse_post("https://a.example"), "https://a.example", GOOD_PAGE, lambda p: next(replies))
+    assert err is None and items[0]["name"] == "SWE Intern"
+
+
 def test_bad_model_reply_is_a_clean_error():
     items, err = extract_internships(parse_post("x https://a.example"), "https://a.example", GOOD_PAGE, lambda p: "sorry, no")
     assert items == [] and err.startswith("extraction failed")
@@ -206,6 +213,7 @@ def test_scoring_sees_the_email_domain_and_free_mail_is_never_auto_approved():
     assert doc["applyLink"] == "mailto:someone@gmail.com"
     assert meta["status"] == "pending_review" and "free_email_domain" in doc["moderation"]["flags"]
     assert doc["moderation"]["source"] == "community_bot"
+    assert "free_email_domain" in doc["moderation"]["scamDetails"]["scamFlags"]
     assert "city" not in doc and "_freeMail" not in doc
 
 

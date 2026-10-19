@@ -614,6 +614,10 @@ def _assemble_moderation(doc: dict, source: str) -> dict:
     if isinstance(doc.get("moderation"), dict):
         raw_flags = doc["moderation"].get("flags") or []
 
+    free_mail = bool(doc.get("_freeMail"))
+    if free_mail:
+        raw_flags = [*raw_flags, "free_email_domain"]
+
     scam_details: ScamDetailsDict = {
         "score":              scam_score,
         "decision":           decision if decision in ("clear", "review", "block") else "review",
@@ -625,12 +629,9 @@ def _assemble_moderation(doc: dict, source: str) -> dict:
     }
 
     mod_status = {"clear": "auto_approved", "block": "auto_rejected"}.get(decision, "pending_review")
-
-    # Applying through a free-mail address (gmail, ...) can't be tied to the company: a moderator must look
-    if doc.get("_freeMail"):
-        raw_flags = [*raw_flags, "free_email_domain"]
-        if mod_status == "auto_approved":
-            mod_status = "pending_review"
+    # A free-mail apply address can't be tied to the company: a moderator must look, never auto-approve
+    if free_mail and mod_status == "auto_approved":
+        mod_status = "pending_review"
 
     doc["moderation"] = {
         "status":          mod_status,

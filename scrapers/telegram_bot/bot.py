@@ -67,11 +67,13 @@ def _token() -> str:
 
 def send_message(chat_id: int, text: str) -> None:
     try:
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{_token()}/sendMessage",
             json={"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True},
             timeout=15,
         )
+        if not resp.ok:      # e.g. the user never pressed Start, or blocked the bot
+            log.warning("sendMessage rejected (%s): %s", resp.status_code, resp.text[:200])
     except Exception as exc:
         log.warning("sendMessage failed: %s", exc)
 
@@ -219,12 +221,18 @@ def process_message(chat_id: int, text: str) -> None:
                 send_message(chat_id, prefix + line)
                 time.sleep(REPLY_GAP_SECONDS)
 
+    log.info("message done", extra={"f": {"posts": len(posts), "autoApproved": any_approved}})
     if any_approved:
         try:
             from script import _trigger_vectorizer
             _trigger_vectorizer()
         except Exception as exc:
             log.warning("vectoriser trigger failed: %s", exc)
+
+
+def _run(chat_id: int, text: str) -> None:
+    send_message(chat_id, "Got it, working on it…")   # in the thread so the webhook answers Telegram at once
+    process_message(chat_id, text)
 
 
 # ─── Webhook ──────────────────────────────────────────────────────────────────
@@ -248,8 +256,7 @@ def handle_update(update: Dict) -> bool:
         send_message(chat_id, HELP)
         return False
 
-    send_message(chat_id, "Got it, working on it…")
-    threading.Thread(target=process_message, args=(chat_id, text), daemon=True).start()
+    threading.Thread(target=_run, args=(chat_id, text), daemon=True).start()
     return True
 
 
