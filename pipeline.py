@@ -86,6 +86,12 @@ class ModerationDict(TypedDict, total=False):
 InternshipSource = Literal["github", "internshala", "indeed", "naukri", "unstop", "freshersworld", "letsintern", "ifind"]
 
 
+class AddressDict(TypedDict, total=False):
+    city: Optional[str]
+    state: Optional[str]
+    country: Optional[str]
+
+
 class InternshipDict(TypedDict, total=False):
     _id: Optional[str]
     _ix: int   # position in the input batch (internal; removed before storing)
@@ -94,9 +100,7 @@ class InternshipDict(TypedDict, total=False):
     applyLink: str
     datePublished: str
     deadlineDate: Optional[str]
-    country: Optional[str]
-    state: Optional[str]
-    city: Optional[str]
+    address: List["AddressDict"]
     isRemote: bool
     stipend: StipendDict
     duration: DurationDict
@@ -196,8 +200,10 @@ def normalize_stipend(raw) -> StipendDict:
 
 def normalize_location(item: dict) -> tuple[str, str, bool]:
     """Return (city, country, is_remote) from various scraper field layouts."""
+    first_addr = next((a for a in (item.get("address") or []) if isinstance(a, dict) and a.get("city")), {}) if isinstance(item.get("address"), list) else {}
     city = (
-        item.get("city")
+        first_addr.get("city")
+        or item.get("city")
         or item.get("location")
         or "remote"
     )
@@ -208,7 +214,7 @@ def normalize_location(item: dict) -> tuple[str, str, bool]:
 
     is_remote = bool(re.search(r"remote|wfh|work from home|online", city, re.IGNORECASE))
 
-    country = item.get("country") or ""
+    country = first_addr.get("country") or item.get("country") or ""
     if not country:
         if re.search(r"remote|wfh|online", city, re.IGNORECASE):
             country = ""
@@ -222,6 +228,37 @@ def normalize_location(item: dict) -> tuple[str, str, bool]:
             country = ""
 
     return city, country, is_remote
+
+
+def normalize_address(item: dict, city: str, country: str, is_remote: bool) -> list:
+    """
+    Return the `address` list: [{city, state, country}, ...].
+
+    An item that already carries `address` (list of dicts, e.g. ifind employer posts or the Telegram bot)
+    keeps every entry that has a city or state. Otherwise one entry is built from the flat
+    city/state/country fields scrapers use (`city` and `country` come from normalize_location).
+    Remote-only listings with no real location get an empty list.
+    """
+    raw = item.get("address")
+    if isinstance(raw, list):
+        out = []
+        for a in raw:
+            if not isinstance(a, dict):
+                continue
+            entry = {k: (str(a.get(k)).strip() or None) if a.get(k) else None for k in ("city", "state", "country")}
+            if entry["city"] or entry["state"]:
+                out.append(entry)
+        return out
+
+    if is_remote and not item.get("state"):
+        return []
+    state = item.get("state")
+    entry = {
+        "city": city or None,
+        "state": str(state).strip() or None if state else None,
+        "country": country or None,
+    }
+    return [entry] if entry["city"] or entry["state"] else []
 
 
 def normalize_skills(raw) -> list:
@@ -299,7 +336,7 @@ _DETECTOR_EXTRA_KEYS = (
     "triggered_rules", "top_contributing_features", "risk_breakdown",
     "hard_disqualifying_forced", "low_confidence_forced_review",
     "shared_infrastructure", "duplicate_cluster_network_size",
-    "_ix",
+    "_ix", "city",
 )
 
 
@@ -387,6 +424,7 @@ def _prepare_candidates(items: list, source: str, is_duplicate, stats: dict, det
             apply_link = normalize_apply_link(item)
             summary    = normalize_summary(item)
             city, country, is_remote = normalize_location(item)
+            address    = normalize_address(item, city, country, is_remote)
             skills     = normalize_skills(item.get("skills"))
 
             # ── Basic validation ──────────────────────────────────────────
@@ -405,7 +443,8 @@ def _prepare_candidates(items: list, source: str, is_duplicate, stats: dict, det
                 continue
 
             # ── Deduplication ─────────────────────────────────────────────
-            fingerprint = generate_fingerprint(company, name, city)
+            # Fingerprint uses the first address's city (same value the flat `city` field used to hold)
+            fingerprint = generate_fingerprint(company, name, (address[0].get("city") if address else None) or city)
             if is_duplicate and is_duplicate(fingerprint):
                 log.debug("  ⏭  Duplicate: '%s' @ %s", name, company)
                 stats["duplicate"] += 1
@@ -446,9 +485,8 @@ def _prepare_candidates(items: list, source: str, is_duplicate, stats: dict, det
                 "company":            company,
                 "applyLink":          apply_link,
                 "summary":            summary,
-                "city":               city or None,
-                "country":            country or None,
-                "state":              item.get("state") or None,
+                "address":            address,
+                "city":               city or None,   # detector input only; dropped by _assemble_moderation
                 "isRemote":           is_remote,
                 "skills":             skills,
                 "degree":             degree,
